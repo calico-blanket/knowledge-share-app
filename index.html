@@ -30,13 +30,15 @@
       justify-content: space-between;
     }
     header h1 { font-size: 18px; font-weight: 600; }
-    #settingsButton {
+    .header-icons { display: flex; gap: 4px; }
+    .icon-button {
       background: none;
       border: none;
       color: #fff;
-      font-size: 22px;
+      font-size: 20px;
       cursor: pointer;
-      padding: 4px 8px;
+      padding: 6px 8px;
+      line-height: 1;
     }
 
     main { padding: 16px; max-width: 480px; margin: 0 auto; }
@@ -58,6 +60,10 @@
       color: #8a90a0;
       margin-bottom: 4px;
     }
+    /* 共有テキストから検出したタイトルらしき文字列（保存前の識別用ヒント） */
+    .title-hint-row { margin-bottom: 8px; }
+    .title-hint-row .label { display: block; font-size: 12px; color: #8a90a0; margin-bottom: 2px; }
+    .title-hint-row .value { font-size: 15px; font-weight: 600; color: #23272f; }
 
     .section-title {
       font-size: 14px;
@@ -116,6 +122,11 @@
       font-size: 14px;
     }
     .settings-panel .note { font-size: 12px; color: #8a90a0; margin-top: 4px; }
+    .settings-section {
+      margin-top: 24px;
+      padding-top: 16px;
+      border-top: 1px solid #eef0f5;
+    }
 
     .primary-button {
       display: block;
@@ -130,6 +141,79 @@
       font-weight: 600;
       cursor: pointer;
     }
+    .secondary-button {
+      display: block;
+      width: 100%;
+      min-height: 48px;
+      border: 2px solid #3949ab;
+      border-radius: 10px;
+      background: #fff;
+      color: #3949ab;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .link-button {
+      background: none;
+      border: none;
+      color: #3949ab;
+      font-size: 14px;
+      cursor: pointer;
+      padding: 8px 0;
+      margin-bottom: 8px;
+    }
+
+    /* カテゴリ管理（設定画面内） */
+    .category-manage-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #eef0f5;
+      font-size: 14px;
+    }
+    .category-remove-button {
+      border: 1px solid #c62828;
+      color: #c62828;
+      background: #fff;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .category-add-row { display: flex; gap: 8px; margin-top: 12px; }
+    .category-add-row input {
+      flex: 1;
+      padding: 10px;
+      border: 1px solid #c9cede;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .category-add-row button {
+      border: none;
+      border-radius: 8px;
+      background: #3949ab;
+      color: #fff;
+      padding: 0 16px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    /* 記事一覧（カテゴリ別） */
+    .list-item {
+      display: block;
+      background: #fff;
+      border: 1px solid #d7dae3;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 10px;
+      text-decoration: none;
+      color: inherit;
+    }
+    .list-item-date { font-size: 12px; color: #8a90a0; margin-bottom: 4px; }
+    .list-item-title { font-size: 15px; font-weight: 600; color: #3949ab; line-height: 1.4; }
+    .list-item-memo { font-size: 13px; color: #5a6070; margin-top: 4px; }
+    .empty-state { font-size: 14px; color: #8a90a0; text-align: center; padding: 32px 0; }
 
     /* 送信中・完了・エラーの状態表示 */
     .status-panel {
@@ -164,14 +248,22 @@
 <body>
   <header>
     <h1>ナレッジ保存</h1>
-    <button id="settingsButton" type="button" aria-label="設定">⚙</button>
+    <div class="header-icons">
+      <button id="driveShortcutButton" class="icon-button" type="button" aria-label="Driveを開く">📁</button>
+      <button id="listButton" class="icon-button" type="button" aria-label="一覧">📋</button>
+      <button id="settingsButton" class="icon-button" type="button" aria-label="設定">⚙</button>
+    </div>
   </header>
 
   <main>
     <!-- ビュー1: カテゴリ選択（メイン画面） -->
     <div id="mainView" class="hidden">
+      <div id="titleHintRow" class="title-hint-row hidden">
+        <span class="label">検出したタイトル（参考・共有元より）</span>
+        <span id="titleHintText" class="value"></span>
+      </div>
       <div class="shared-url">
-        <span class="label">保存する記事</span>
+        <span class="label">保存する記事のURL</span>
         <span id="sharedUrlText"></span>
       </div>
       <!-- 共有パラメータ無しで開いたとき用の手動入力欄 -->
@@ -192,23 +284,47 @@
         <input id="tokenInput" type="text" placeholder="設定した合言葉">
         <p class="note">GAS側で未設定なら空欄でかまいません</p>
         <button id="saveSettingsButton" class="primary-button" type="button">保存する</button>
+
+        <div id="categoryManageSection" class="settings-section hidden">
+          <p class="section-title">カテゴリ管理</p>
+          <div id="categoryManageList"></div>
+          <div class="category-add-row">
+            <input id="newCategoryInput" type="text" placeholder="新しいカテゴリ名">
+            <button id="addCategoryButton" type="button">追加</button>
+          </div>
+          <p class="note">削除してもDriveに保存済みの記事は残ります。改名は「削除して追加」で対応してください。</p>
+        </div>
       </div>
     </div>
 
-    <!-- ビュー3: 送信中 -->
+    <!-- ビュー3: カテゴリ別一覧（カテゴリ選択） -->
+    <div id="listCategoryView" class="hidden">
+      <button id="listCategoryBackButton" class="link-button" type="button">← 保存画面に戻る</button>
+      <p class="section-title">カテゴリを選んで一覧表示</p>
+      <div id="listCategoryGrid" class="category-grid"></div>
+    </div>
+
+    <!-- ビュー4: カテゴリ別一覧（記事一覧） -->
+    <div id="listItemsView" class="hidden">
+      <button id="listItemsBackButton" class="link-button" type="button">← カテゴリ選択に戻る</button>
+      <p id="listItemsTitle" class="section-title"></p>
+      <div id="listItemsContainer"></div>
+    </div>
+
+    <!-- ビュー5: 送信中 -->
     <div id="sendingView" class="status-panel hidden">
       <div class="spinner"></div>
       <p class="message">保存しています…</p>
     </div>
 
-    <!-- ビュー4: 完了 -->
+    <!-- ビュー6: 完了 -->
     <div id="doneView" class="status-panel hidden">
       <div class="icon">✅</div>
       <p class="message">保存しました！<br>この画面は閉じてOKです</p>
       <p id="doneDetail" class="detail"></p>
     </div>
 
-    <!-- ビュー5: エラー -->
+    <!-- ビュー7: エラー -->
     <div id="errorView" class="status-panel error hidden">
       <div class="icon">⚠️</div>
       <p class="message">保存に失敗しました</p>
@@ -221,25 +337,14 @@
     'use strict';
 
     // ============================================================
-    // 定数・設定
+    // 定数・状態
     // ============================================================
-
-    // カテゴリ一覧（GAS側 Code.gs の CATEGORIES と必ず一致させること）
-    var CATEGORIES = [
-      '業務マニュアル',
-      '自由掲示板',
-      'PC系',
-      'DTP系',
-      'その他PC学習、スキル',
-      'PCニュース',
-      '語学系',
-      '英語・中国語',
-      'レシピ、お店',
-      'TOCO/お知らせ'
-    ];
 
     // localStorage に保存する設定のキー
     var SETTINGS_KEY = 'knowledgeShareSettings';
+
+    // カテゴリ一覧・Driveフォルダ URL は起動時に GAS から動的取得する（ハードコードしない）
+    var state = { categories: [], rootFolderUrl: '' };
 
     // ============================================================
     // 共有パラメータの解析（純粋関数・テスト対象）
@@ -252,7 +357,8 @@
      * Androidの共有シートはアプリによって url / text / title のどこに
      * URLを入れるかが揺れる（Chromeは text に入れることが多い）ため、
      * shared_url → shared_text → shared_title の順にURLを探す。
-     * shared_text からURLを除いた残りは、ユーザーの一言コメントとして扱う。
+     * shared_text からURLを除いた残りは、記事タイトルの参考表示・ユーザーの
+     * 一言コメントの両方として扱う（共有元がどちらの意図で付けたかは区別できないため）。
      *
      * @param {string} queryString - location.search の文字列（例: "?shared_text=..."）
      * @returns {{url: string, memo: string}} 見つからなければ url は空文字
@@ -320,7 +426,10 @@
     // 画面の切り替え
     // ============================================================
 
-    var VIEW_IDS = ['mainView', 'settingsView', 'sendingView', 'doneView', 'errorView'];
+    var VIEW_IDS = [
+      'mainView', 'settingsView', 'listCategoryView', 'listItemsView',
+      'sendingView', 'doneView', 'errorView'
+    ];
 
     /** 指定したビューだけを表示し、他は隠す */
     function showView(viewId) {
@@ -329,56 +438,78 @@
       });
     }
 
-    // ============================================================
-    // 保存処理（GAS WebアプリへPOST）
-    // ============================================================
-
-    /**
-     * カテゴリボタンが押されたときの保存処理。
-     * Content-Type を text/plain にすることで CORS のプリフライトを回避する
-     * （GAS Webアプリは OPTIONS リクエストに応答できないため）。
-     */
-    async function submitToGas(url, category, memo) {
-      var settings = loadSettings();
-      if (!settings) {
-        showView('settingsView');
-        return;
-      }
-
-      showView('sendingView');
-
-      try {
-        var response = await fetch(settings.gasUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({
-            url: url,
-            category: category,
-            memo: memo,
-            token: settings.token || ''
-          })
-        });
-
-        var result = await response.json();
-
-        if (result.ok) {
-          document.getElementById('doneDetail').textContent =
-            result.folderPath + ' に「' + result.fileName + '」を保存';
-          showView('doneView');
-          // 共有シートから開かれたウィンドウなら閉じられる場合がある（失敗しても無害）
-          setTimeout(function () { window.close(); }, 1500);
-        } else {
-          throw new Error(result.error || '原因不明のエラー');
-        }
-      } catch (err) {
-        console.error('保存に失敗しました:', err);
-        document.getElementById('errorDetail').textContent = String(err.message || err);
-        showView('errorView');
-      }
+    /** HTMLエスケープ（一覧の記事タイトル・メモなど外部由来の文字列を表示する際に使う） */
+    function escapeHtml(text) {
+      var div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
     }
 
     // ============================================================
-    // 初期化
+    // GAS通信の共通ヘルパー
+    // ============================================================
+
+    /**
+     * GAS WebアプリへPOSTする。Content-Type を text/plain にすることで
+     * CORS のプリフライトを回避する（GAS Webアプリは OPTIONS に応答できないため）。
+     */
+    async function gasPost(bodyObj) {
+      var settings = loadSettings();
+      if (!settings) { throw new Error('設定が未保存です'); }
+      var response = await fetch(settings.gasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(Object.assign({ token: settings.token || '' }, bodyObj))
+      });
+      return response.json();
+    }
+
+    /** GAS WebアプリへGETする（一覧・カテゴリ取得用） */
+    async function gasGet(action, extraParams) {
+      var settings = loadSettings();
+      if (!settings) { throw new Error('設定が未保存です'); }
+      var url = new URL(settings.gasUrl);
+      url.searchParams.set('action', action);
+      Object.keys(extraParams || {}).forEach(function (key) {
+        url.searchParams.set(key, extraParams[key]);
+      });
+      var response = await fetch(url.toString());
+      return response.json();
+    }
+
+    /** カテゴリ一覧とDriveフォルダURLをGASから取得し、state に反映する */
+    async function fetchCategories() {
+      var result = await gasGet('categories');
+      if (!result.ok) { throw new Error(result.error || 'カテゴリの取得に失敗しました'); }
+      state.categories = result.categories;
+      state.rootFolderUrl = result.rootFolderUrl;
+      return result;
+    }
+
+    // ============================================================
+    // カテゴリボタンの描画（保存画面・一覧画面で共用）
+    // ============================================================
+
+    /** カテゴリボタンをコンテナに描画する。タップ時に onSelect(category) を呼ぶ */
+    function renderCategoryButtons(containerId, categories, onSelect) {
+      var grid = document.getElementById(containerId);
+      grid.innerHTML = '';
+      if (!categories.length) {
+        grid.innerHTML = '<p class="empty-state">カテゴリがありません。設定画面から追加してください。</p>';
+        return;
+      }
+      categories.forEach(function (category) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'category-button';
+        button.textContent = category;
+        button.addEventListener('click', function () { onSelect(category); });
+        grid.appendChild(button);
+      });
+    }
+
+    // ============================================================
+    // 保存処理（GAS WebアプリへPOST）
     // ============================================================
 
     /** 現在の保存対象URLを返す（共有パラメータ優先、無ければ手動入力欄） */
@@ -388,29 +519,221 @@
       return document.getElementById('manualUrlInput').value.trim();
     }
 
-    function init() {
-      var shared = parseSharedParams(location.search);
-      var settings = loadSettings();
+    /** カテゴリボタンが押されたときの保存処理 */
+    async function submitToGas(url, category, memo) {
+      showView('sendingView');
+      try {
+        var result = await gasPost({ action: 'save', url: url, category: category, memo: memo });
+        if (!result.ok) { throw new Error(result.error || '原因不明のエラー'); }
 
-      // ステップ1: カテゴリボタンを生成
-      var grid = document.getElementById('categoryGrid');
-      CATEGORIES.forEach(function (category) {
-        var button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'category-button';
-        button.textContent = category;
-        button.addEventListener('click', function () {
+        document.getElementById('doneDetail').textContent =
+          result.folderPath + ' に「' + result.fileName + '」を保存';
+        showView('doneView');
+        // 共有シートから開かれたウィンドウなら閉じられる場合がある（失敗しても無害）
+        setTimeout(function () { window.close(); }, 1500);
+      } catch (err) {
+        console.error('保存に失敗しました:', err);
+        document.getElementById('errorDetail').textContent = String(err.message || err);
+        showView('errorView');
+      }
+    }
+
+    // ============================================================
+    // カテゴリ別一覧画面
+    // ============================================================
+
+    async function openListCategoryView() {
+      showView('listCategoryView');
+      try {
+        await fetchCategories();
+        renderCategoryButtons('listCategoryGrid', state.categories, openListItemsView);
+      } catch (err) {
+        document.getElementById('listCategoryGrid').innerHTML =
+          '<p class="empty-state">カテゴリの取得に失敗しました: ' + escapeHtml(String(err.message || err)) + '</p>';
+      }
+    }
+
+    async function openListItemsView(category) {
+      document.getElementById('listItemsTitle').textContent = category + ' の記事一覧';
+      var container = document.getElementById('listItemsContainer');
+      container.innerHTML = '<p class="empty-state">読み込み中…</p>';
+      showView('listItemsView');
+
+      try {
+        var result = await gasGet('list', { category: category });
+        if (!result.ok) { throw new Error(result.error || '取得に失敗しました'); }
+        renderListItems(result.items);
+      } catch (err) {
+        console.error('一覧の取得に失敗しました:', err);
+        container.innerHTML =
+          '<p class="empty-state">取得に失敗しました。GASの公開設定（アクセスできるユーザー: 全員）を確認してください。<br>' +
+          escapeHtml(String(err.message || err)) + '</p>';
+      }
+    }
+
+    function renderListItems(items) {
+      var container = document.getElementById('listItemsContainer');
+      if (!items.length) {
+        container.innerHTML = '<p class="empty-state">このカテゴリにはまだ保存された記事がありません</p>';
+        return;
+      }
+      container.innerHTML = items.map(function (item) {
+        var memoHtml = item.memo
+          ? '<div class="list-item-memo">' + escapeHtml(item.memo) + '</div>'
+          : '';
+        return '<a class="list-item" href="' + escapeHtml(item.url) + '" target="_blank" rel="noopener">' +
+          '<div class="list-item-date">' + escapeHtml(item.savedAt) + '</div>' +
+          '<div class="list-item-title">' + escapeHtml(item.title) + '</div>' +
+          memoHtml +
+          '</a>';
+      }).join('');
+    }
+
+    // ============================================================
+    // カテゴリ管理（設定画面内）
+    // ============================================================
+
+    function renderCategoryManageList() {
+      var container = document.getElementById('categoryManageList');
+      container.innerHTML = '';
+      state.categories.forEach(function (name) {
+        var row = document.createElement('div');
+        row.className = 'category-manage-row';
+
+        var label = document.createElement('span');
+        label.textContent = name;
+
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'category-remove-button';
+        removeBtn.textContent = '削除';
+        removeBtn.addEventListener('click', function () { handleRemoveCategory(name); });
+
+        row.appendChild(label);
+        row.appendChild(removeBtn);
+        container.appendChild(row);
+      });
+    }
+
+    async function refreshCategoryManageUi() {
+      try {
+        await fetchCategories();
+        document.getElementById('categoryManageSection').classList.remove('hidden');
+        renderCategoryManageList();
+      } catch (err) {
+        console.warn('カテゴリ管理用の一覧取得に失敗:', err);
+      }
+    }
+
+    async function handleAddCategory() {
+      var input = document.getElementById('newCategoryInput');
+      var name = input.value.trim();
+      if (!name) { return; }
+      try {
+        var result = await gasPost({ action: 'addCategory', name: name });
+        if (!result.ok) { throw new Error(result.error || '追加に失敗しました'); }
+        state.categories = result.categories;
+        input.value = '';
+        renderCategoryManageList();
+      } catch (err) {
+        alert('カテゴリの追加に失敗しました: ' + String(err.message || err));
+      }
+    }
+
+    async function handleRemoveCategory(name) {
+      if (!confirm('「' + name + '」を削除しますか？（Driveに保存済みの記事は残ります）')) { return; }
+      try {
+        var result = await gasPost({ action: 'removeCategory', name: name });
+        if (!result.ok) { throw new Error(result.error || '削除に失敗しました'); }
+        state.categories = result.categories;
+        renderCategoryManageList();
+      } catch (err) {
+        alert('カテゴリの削除に失敗しました: ' + String(err.message || err));
+      }
+    }
+
+    // ============================================================
+    // 初期化
+    // ============================================================
+
+    function wireStaticEventListeners() {
+      // 設定ボタン: 現在の保存値を入力欄に反映してから設定画面へ
+      document.getElementById('settingsButton').addEventListener('click', function () {
+        var current = loadSettings() || { gasUrl: '', token: '' };
+        document.getElementById('gasUrlInput').value = current.gasUrl;
+        document.getElementById('tokenInput').value = current.token || '';
+        showView('settingsView');
+        if (current.gasUrl) { refreshCategoryManageUi(); }
+      });
+
+      document.getElementById('saveSettingsButton').addEventListener('click', async function () {
+        var gasUrl = document.getElementById('gasUrlInput').value.trim();
+        var token = document.getElementById('tokenInput').value.trim();
+        if (!/^https:\/\/script\.google\.com\/.+/.test(gasUrl)) {
+          alert('GAS WebアプリのURL（https://script.google.com/…）を入力してください');
+          return;
+        }
+        saveSettings(gasUrl, token);
+        await initMainView();
+        showView('mainView');
+      });
+
+      document.getElementById('addCategoryButton').addEventListener('click', handleAddCategory);
+
+      // 一覧ボタン・戻るボタン
+      document.getElementById('listButton').addEventListener('click', openListCategoryView);
+      document.getElementById('listCategoryBackButton').addEventListener('click', function () {
+        showView('mainView');
+      });
+      document.getElementById('listItemsBackButton').addEventListener('click', openListCategoryView);
+
+      // Driveショートカット（ナレッジフォルダを新規タブで開く）
+      document.getElementById('driveShortcutButton').addEventListener('click', async function () {
+        if (!loadSettings()) {
+          alert('先に設定画面でGAS WebアプリのURLを保存してください。');
+          showView('settingsView');
+          return;
+        }
+        try {
+          if (!state.rootFolderUrl) { await fetchCategories(); }
+          window.open(state.rootFolderUrl, '_blank', 'noopener');
+        } catch (err) {
+          alert('Driveフォルダの取得に失敗しました: ' + String(err.message || err));
+        }
+      });
+
+      // エラー画面からの復帰
+      document.getElementById('retryButton').addEventListener('click', function () {
+        showView('mainView');
+      });
+    }
+
+    /** 保存画面（メイン画面）の内容を最新のカテゴリで描画する */
+    async function initMainView() {
+      try {
+        await fetchCategories();
+        renderCategoryButtons('categoryGrid', state.categories, function (category) {
           var url = getCurrentUrl();
           if (!url) {
             alert('URLがありません。共有シートから開くか、URLを入力してください。');
             return;
           }
+          var shared = parseSharedParams(location.search);
           submitToGas(url, category, shared.memo);
         });
-        grid.appendChild(button);
-      });
+      } catch (err) {
+        document.getElementById('categoryGrid').innerHTML =
+          '<p class="empty-state">カテゴリの取得に失敗しました: ' + escapeHtml(String(err.message || err)) + '</p>';
+      }
+    }
 
-      // ステップ2: 共有されたURLの表示（無ければ手動入力欄を出す）
+    async function init() {
+      var shared = parseSharedParams(location.search);
+      var settings = loadSettings();
+
+      wireStaticEventListeners();
+
+      // 共有されたURLの表示（無ければ手動入力欄を出す）
       if (shared.url) {
         document.getElementById('sharedUrlText').textContent = shared.url;
       } else {
@@ -419,41 +742,22 @@
         document.getElementById('manualUrlInput').classList.remove('hidden');
       }
 
-      // ステップ3: 設定の有無で最初の画面を決める
+      // 共有テキストから検出したタイトルらしき文字列があれば表示（保存前の識別用）
+      if (shared.memo) {
+        document.getElementById('titleHintText').textContent = shared.memo;
+        document.getElementById('titleHintRow').classList.remove('hidden');
+      }
+
       if (settings) {
         showView('mainView');
+        await initMainView();
       } else {
         showView('settingsView');
       }
 
-      // ステップ4: 設定画面のイベント登録
-      document.getElementById('settingsButton').addEventListener('click', function () {
-        var current = loadSettings() || { gasUrl: '', token: '' };
-        document.getElementById('gasUrlInput').value = current.gasUrl;
-        document.getElementById('tokenInput').value = current.token || '';
-        showView('settingsView');
-      });
-
-      document.getElementById('saveSettingsButton').addEventListener('click', function () {
-        var gasUrl = document.getElementById('gasUrlInput').value.trim();
-        var token = document.getElementById('tokenInput').value.trim();
-        if (!/^https:\/\/script\.google\.com\/.+/.test(gasUrl)) {
-          alert('GAS WebアプリのURL（https://script.google.com/…）を入力してください');
-          return;
-        }
-        saveSettings(gasUrl, token);
-        showView('mainView');
-      });
-
-      // ステップ5: エラー画面からの復帰
-      document.getElementById('retryButton').addEventListener('click', function () {
-        showView('mainView');
-      });
-
-      // ステップ6: サービスワーカー登録（PWAインストール要件）
+      // サービスワーカー登録（PWAインストール要件）
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('/sw.js').catch(function (err) {
-          // 登録失敗してもアプリ自体は動くため、ログだけ残す
           console.warn('サービスワーカーの登録に失敗:', err);
         });
       }
