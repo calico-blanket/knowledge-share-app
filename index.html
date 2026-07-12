@@ -252,6 +252,7 @@
       <button id="driveShortcutButton" class="icon-button" type="button" aria-label="Driveを開く">📁</button>
       <button id="listButton" class="icon-button" type="button" aria-label="一覧">📋</button>
       <button id="settingsButton" class="icon-button" type="button" aria-label="設定">⚙</button>
+      <button id="exitButton" class="icon-button" type="button" aria-label="終了">✕</button>
     </div>
   </header>
 
@@ -320,7 +321,7 @@
     <!-- ビュー6: 完了 -->
     <div id="doneView" class="status-panel hidden">
       <div class="icon">✅</div>
-      <p class="message">保存しました！<br>この画面は閉じてOKです</p>
+      <p class="message">保存しました！</p>
       <p id="doneDetail" class="detail"></p>
     </div>
 
@@ -529,8 +530,9 @@
         document.getElementById('doneDetail').textContent =
           result.folderPath + ' に「' + result.fileName + '」を保存';
         showView('doneView');
-        // 共有シートから開かれたウィンドウなら閉じられる場合がある（失敗しても無害）
-        setTimeout(function () { window.close(); }, 1500);
+        // 自動でアプリを閉じるとユーザーが混乱するため、少し表示してからトップ画面（カテゴリ選択）に戻る。
+        // 明示的に終了したい場合はヘッダーの「終了」ボタンを使ってもらう。
+        setTimeout(function () { showView('mainView'); }, 1200);
       } catch (err) {
         console.error('保存に失敗しました:', err);
         document.getElementById('errorDetail').textContent = String(err.message || err);
@@ -705,6 +707,16 @@
       // エラー画面からの復帰
       document.getElementById('retryButton').addEventListener('click', function () {
         showView('mainView');
+      });
+
+      // 終了ボタン: アプリを明示的に閉じる。
+      // window.close() は「スクリプトで開いたウィンドウ」以外では効かないブラウザがあるため、
+      // 少し待っても画面が残っている（＝閉じられなかった）場合は手動で閉じるよう案内する。
+      document.getElementById('exitButton').addEventListener('click', function () {
+        window.close();
+        setTimeout(function () {
+          alert('この画面を自動では閉じられませんでした。お手数ですが手動で閉じてください。');
+        }, 300);
       });
     }
 
