@@ -465,12 +465,14 @@
       return response.json();
     }
 
-    /** GAS WebアプリへGETする（一覧・カテゴリ取得用） */
+    /** GAS WebアプリへGETする（一覧・カテゴリ取得用）。
+     * 記事一覧等は個人情報に近いため、GET側もPOSTと同じ合言葉で保護されている。 */
     async function gasGet(action, extraParams) {
       var settings = loadSettings();
       if (!settings) { throw new Error('設定が未保存です'); }
       var url = new URL(settings.gasUrl);
       url.searchParams.set('action', action);
+      url.searchParams.set('token', settings.token || '');
       Object.keys(extraParams || {}).forEach(function (key) {
         url.searchParams.set(key, extraParams[key]);
       });
@@ -573,22 +575,53 @@
       }
     }
 
+    /**
+     * 記事一覧を描画する。
+     * 外部由来のデータ（タイトル・URL・メモ）を扱うため、HTML文字列の結合ではなく
+     * DOM APIで組み立てる（文字列結合+escapeHtmlでは、URLに含まれる引用符による
+     * 属性からの抜け出し（XSS）を防ぎきれないため）。
+     */
     function renderListItems(items) {
       var container = document.getElementById('listItemsContainer');
+      container.innerHTML = '';
+
       if (!items.length) {
-        container.innerHTML = '<p class="empty-state">このカテゴリにはまだ保存された記事がありません</p>';
+        var empty = document.createElement('p');
+        empty.className = 'empty-state';
+        empty.textContent = 'このカテゴリにはまだ保存された記事がありません';
+        container.appendChild(empty);
         return;
       }
-      container.innerHTML = items.map(function (item) {
-        var memoHtml = item.memo
-          ? '<div class="list-item-memo">' + escapeHtml(item.memo) + '</div>'
-          : '';
-        return '<a class="list-item" href="' + escapeHtml(item.url) + '" target="_blank" rel="noopener">' +
-          '<div class="list-item-date">' + escapeHtml(item.savedAt) + '</div>' +
-          '<div class="list-item-title">' + escapeHtml(item.title) + '</div>' +
-          memoHtml +
-          '</a>';
-      }).join('');
+
+      items.forEach(function (item) {
+        var link = document.createElement('a');
+        link.className = 'list-item';
+        // http/https 以外（シートを手で編集した場合等）はリンクにしない防御
+        if (/^https?:\/\//i.test(item.url)) {
+          link.href = item.url;
+          link.target = '_blank';
+          link.rel = 'noopener';
+        }
+
+        var date = document.createElement('div');
+        date.className = 'list-item-date';
+        date.textContent = item.savedAt;
+        link.appendChild(date);
+
+        var title = document.createElement('div');
+        title.className = 'list-item-title';
+        title.textContent = item.title;
+        link.appendChild(title);
+
+        if (item.memo) {
+          var memo = document.createElement('div');
+          memo.className = 'list-item-memo';
+          memo.textContent = item.memo;
+          link.appendChild(memo);
+        }
+
+        container.appendChild(link);
+      });
     }
 
     // ============================================================

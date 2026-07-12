@@ -118,3 +118,23 @@ test('終了ボタン: クリックでwindow.close()を呼ぶ', () => {
   assert.ok(m, '終了ボタンのクリックハンドラが存在すること');
   assert.match(m[1], /window\.close\(\)/, 'ハンドラ内でwindow.close()を呼んでいること');
 });
+
+test('XSS対策: 一覧描画がHTML文字列結合ではなくDOM APIで組み立てられている', () => {
+  // 文字列結合+escapeHtmlでは、URL内の引用符による属性breakoutを防げない
+  // （escapeHtmlはダブルクォートをエスケープしない）ため、DOM APIで構築する。
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.doesNotMatch(html, /href="' \+ escapeHtml/, '旧実装(文字列結合href)が復活していないこと');
+
+  const m = html.match(/function renderListItems\(items\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderListItems関数が存在すること');
+  assert.match(m[1], /createElement\('a'\)/, 'DOM APIでリンクを生成していること');
+  assert.match(m[1], /textContent/, 'テキストはtextContentで設定していること');
+  assert.match(m[1], /\^https\?:/, 'hrefに設定する前にURLスキームを検証していること');
+});
+
+test('GET保護: gasGetがtokenパラメータを付与している', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function gasGet\(action, extraParams\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'gasGet関数が存在すること');
+  assert.match(m[1], /searchParams\.set\('token'/, 'GETリクエストにもtokenを含めること');
+});

