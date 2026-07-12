@@ -92,14 +92,29 @@ test('カテゴリ管理: index.html にカテゴリのハードコード配列�
   assert.match(html, /gasGet\('categories'\)/, 'GASのcategoriesエンドポイントを呼んでいること');
 });
 
-test('新機能のUI要素: 一覧・カテゴリ管理・Driveショートカットに必要なDOM idが揃っている', () => {
+test('新機能のUI要素: 一覧・カテゴリ管理・Driveショートカット・終了ボタンに必要なDOM idが揃っている', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   var requiredIds = [
     'driveShortcutButton', 'listButton', 'listCategoryView', 'listCategoryGrid',
     'listItemsView', 'listItemsContainer', 'categoryManageSection', 'categoryManageList',
-    'newCategoryInput', 'addCategoryButton', 'titleHintRow', 'titleHintText'
+    'newCategoryInput', 'addCategoryButton', 'titleHintRow', 'titleHintText', 'exitButton'
   ];
   requiredIds.forEach(function (id) {
     assert.match(html, new RegExp('id="' + id + '"'), 'id="' + id + '" が存在すること');
   });
+});
+
+test('保存後の画面遷移: 自動でwindow.close()せず、トップ画面(mainView)に戻る', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // 旧仕様（保存成功後に自動でウィンドウを閉じる）が復活していないことの回帰確認
+  assert.doesNotMatch(html, /setTimeout\(function \(\) \{ window\.close\(\); \}/);
+  // 保存成功後、doneViewを一定時間表示してからmainViewへ戻る処理があること
+  assert.match(html, /setTimeout\(function \(\) \{ showView\('mainView'\); \}, 1200\)/);
+});
+
+test('終了ボタン: クリックでwindow.close()を呼ぶ', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/getElementById\('exitButton'\)\.addEventListener\('click', function \(\) \{([\s\S]*?)\}\);/);
+  assert.ok(m, '終了ボタンのクリックハンドラが存在すること');
+  assert.match(m[1], /window\.close\(\)/, 'ハンドラ内でwindow.close()を呼んでいること');
 });
