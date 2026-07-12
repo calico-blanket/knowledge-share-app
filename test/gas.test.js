@@ -27,6 +27,7 @@ function createFolderStub(name) {
     name,
     subFolders: [],
     files: [],
+    driveFiles: [], // addFile/removeFile で管理する汎用ファイル参照（Sheets移動用）
     getFoldersByName(target) {
       const hits = folder.subFolders.filter((f) => f.name === target);
       return makeIterator(hits);
@@ -44,9 +45,83 @@ function createFolderStub(name) {
       const file = { name: fileName, content, mimeType, getId: () => 'file-' + fileName };
       folder.files.push(file);
       return file;
+    },
+    getUrl() {
+      return 'https://drive.google.com/drive/folders/stub-' + encodeURIComponent(name);
+    },
+    addFile(fileHandle) {
+      folder.driveFiles.push(fileHandle);
+      // Googleドキュメント（DocumentApp.create相当）の場合は、既存の files 配列にも
+      // 登録する。同一オブジェクト参照なので、後から doc.getBody().setText() で
+      // 更新される content もテスト側からそのまま参照できる（実際のDrive APIでも
+      // getFilesByName はファイル種別を問わず名前一致で見つかる）。
+      if (fileHandle._isDoc) {
+        folder.files.push(fileHandle);
+      }
+      return folder;
+    },
+    removeFile(fileHandle) {
+      const idx = folder.driveFiles.indexOf(fileHandle);
+      if (idx !== -1) { folder.driveFiles.splice(idx, 1); }
+      return folder;
     }
   };
   return folder;
+}
+
+/**
+ * インメモリのスプレッドシート「シート」を作る。
+ * appendRow / getRange().setFormula / getDataRange().getValues だけ実装する。
+ * setFormula は =HYPERLINK("url","title") 形式を解釈し、表示値(title)をセルに反映する
+ * （本物のSheetsが数式を計算表示するのと同じ見え方をNode側で再現するため）。
+ */
+function createSheetStub() {
+  const rows = [];
+  return {
+    _rows: rows,
+    appendRow(values) { rows.push(values.slice()); },
+    setFrozenRows() {},
+    getLastRow() { return rows.length; },
+    getRange(row, col) {
+      return {
+        setFormula(formula) {
+          const m = formula.match(/HYPERLINK\("((?:[^"]|"")*)","((?:[^"]|"")*)"\)/);
+          if (m) {
+            rows[row - 1][col - 1] = m[2].replace(/""/g, '"');
+          }
+        }
+      };
+    },
+    getDataRange() {
+      return { getValues: () => rows.map((r) => r.slice()) };
+    }
+  };
+}
+
+/**
+ * インメモリの Googleドキュメント「ハンドル」を作る。
+ * getBody().setText() で content プロパティを直接更新する（folder.files に登録された
+ * 同一オブジェクトからも参照できるようにするため、別オブジェクトへコピーしない）。
+ */
+function createDocStub(id, name) {
+  const handle = {
+    _isDoc: true,
+    name,
+    content: '',
+    mimeType: 'application/vnd.google-apps.document',
+    getId: () => id,
+    getUrl: () => 'https://docs.google.com/document/d/' + id + '/edit',
+    getBody() {
+      return {
+        setText(text) {
+          handle.content = text;
+          return this;
+        }
+      };
+    },
+    saveAndClose() {}
+  };
+  return handle;
 }
 
 /** GAS の FolderIterator/FileIterator 相当（hasNext/next だけ） */
@@ -76,11 +151,44 @@ function makeFetchResponse({ code = 200, body = '', headers = {} }) {
 function loadGasScript(options = {}) {
   const rootFolder = createFolderStub('(root)');
   const fetchCalls = [];
+  const driveFilesById = {}; // ファイルID -> ハンドル（SpreadsheetApp.create が登録する）
+  const spreadsheetsById = {}; // スプレッドシートID -> {getId, getSheets}
+  let spreadsheetIdCounter = 0;
+  let docIdCounter = 0;
+  const scriptProps = Object.assign({}, options.scriptProperties || {});
 
   const context = {
     // --- DriveApp スタブ ---
     DriveApp: {
-      getRootFolder: () => rootFolder
+      getRootFolder: () => rootFolder,
+      getFileById(id) {
+        if (!driveFilesById[id]) { throw new Error('スタブ: ファイルが見つかりません ' + id); }
+        return driveFilesById[id];
+      }
+    },
+    // --- SpreadsheetApp スタブ ---
+    SpreadsheetApp: {
+      create(name) {
+        const id = 'ss-' + (++spreadsheetIdCounter);
+        const sheet = createSheetStub();
+        const spreadsheet = { getId: () => id, getSheets: () => [sheet], _sheet: sheet };
+        spreadsheetsById[id] = spreadsheet;
+        driveFilesById[id] = { getId: () => id, name: name };
+        return spreadsheet;
+      },
+      openById(id) {
+        if (!spreadsheetsById[id]) { throw new Error('スタブ: スプレッドシートが見つかりません ' + id); }
+        return spreadsheetsById[id];
+      }
+    },
+    // --- DocumentApp スタブ ---
+    DocumentApp: {
+      create(name) {
+        const id = 'doc-' + (++docIdCounter);
+        const handle = createDocStub(id, name);
+        driveFilesById[id] = handle;
+        return handle;
+      }
     },
     // --- UrlFetchApp スタブ ---
     UrlFetchApp: {
@@ -92,10 +200,11 @@ function loadGasScript(options = {}) {
         return makeFetchResponse({ body: '<title>デフォルトタイトル</title>' });
       }
     },
-    // --- PropertiesService スタブ ---
+    // --- PropertiesService スタブ（getProperty/setProperty とも同じオブジェクトを共有） ---
     PropertiesService: {
       getScriptProperties: () => ({
-        getProperty: (key) => (options.scriptProperties || {})[key] || null
+        getProperty: (key) => scriptProps[key] || null,
+        setProperty: (key, value) => { scriptProps[key] = value; }
       })
     },
     // --- Utilities スタブ（formatDate は固定日時で単純実装） ---
@@ -129,13 +238,26 @@ function loadGasScript(options = {}) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
   vm.runInContext(source, context);
 
-  return { context, rootFolder, fetchCalls };
+  return { context, rootFolder, fetchCalls, spreadsheetsById };
 }
 
 /** doPost をJSONボディ付きで呼び、レスポンスJSONをパースして返す */
 function callDoPost(context, bodyObj) {
   const e = { postData: { contents: JSON.stringify(bodyObj) } };
   const output = context.doPost(e);
+  return JSON.parse(output.getContent());
+}
+
+/** doGet を ?action=list&category=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetList(context, category) {
+  const e = { parameter: { action: 'list', category: category } };
+  const output = context.doGet(e);
+  return JSON.parse(output.getContent());
+}
+
+/** doGet を ?action=categories で呼び、レスポンスJSONを返す */
+function callDoGetCategories(context) {
+  const output = context.doGet({ parameter: { action: 'categories' } });
   return JSON.parse(output.getContent());
 }
 
@@ -150,7 +272,7 @@ test('正常系: タイトル取得 → ナレッジ/カテゴリ/ に日付+タ
 
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.title, 'テスト記事のタイトル');
-  assert.match(result.fileName, /^\d{4}-\d{2}-\d{2}_テスト記事のタイトル\.md$/);
+  assert.match(result.fileName, /^テスト記事のタイトル_\d{4}-\d{2}-\d{2}\.md$/);
   assert.strictEqual(result.folderPath, 'ナレッジ/PC系');
 
   // Drive 側の実体を確認: ナレッジ → PC系 → ファイル1件
@@ -201,7 +323,7 @@ test('正常系: 同名ファイルが既にある場合は時刻付きの別名
   const files = rootFolder.subFolders[0].subFolders[0].files;
   assert.strictEqual(files.length, 2, '2ファイルとも保存される');
   assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名が衝突しない');
-  assert.match(files[1].name, /^\d{4}-\d{2}-\d{2}_\d{6}_同じタイトル\.md$/);
+  assert.match(files[1].name, /^同じタイトル_\d{4}-\d{2}-\d{2}_\d{6}\.md$/);
 });
 
 // ---- タイトル取得のフォールバック -----------------------------
@@ -269,15 +391,20 @@ test('sanitizeFileName_: Windows禁止文字がスペースに置換される', 
 
 test('buildFileName_: 空タイトルは「無題」になる', () => {
   const { context } = loadGasScript();
-  assert.strictEqual(context.buildFileName_('2026-07-12', ''), '2026-07-12_無題.md');
+  assert.strictEqual(context.buildFileName_('', '2026-07-12'), '無題_2026-07-12.md');
 });
 
 test('buildFileName_: 長すぎるタイトルは切り詰められる', () => {
   const { context } = loadGasScript();
   const longTitle = 'あ'.repeat(200);
-  const name = context.buildFileName_('2026-07-12', longTitle);
+  const name = context.buildFileName_(longTitle, '2026-07-12');
   assert.ok(name.length < 100, '切り詰め後のファイル名が十分短い: ' + name.length);
-  assert.match(name, /…\.md$/);
+  assert.match(name, /^あ+…_2026-07-12\.md$/);
+});
+
+test('buildFileName_: タイトルが先頭、日付が末尾になる（Drive一覧でタイトルが読みやすいように）', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.buildFileName_('記事タイトル', '2026-07-12'), '記事タイトル_2026-07-12.md');
 });
 
 // ---- 異常系（入力バリデーション） ------------------------------
@@ -355,4 +482,413 @@ test('カテゴリ: 初期リスト10件すべてが受理され、同名フォ�
   const knowledge = rootFolder.subFolders.find((f) => f.name === 'ナレッジ');
   const folderNames = knowledge.subFolders.map((f) => f.name);
   assert.deepStrictEqual(folderNames.sort(), [...expected].sort());
+});
+
+// ---- 検索用インデックス（Sheets）と一覧API -----------------------
+
+test('インデックス: 保存すると同時にSheetsへ1行追記される（初回はシートも自動作成）', () => {
+  const { context, spreadsheetsById } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>索引テスト記事</title>' })
+  });
+
+  callDoPost(context, { url: 'https://example.com/idx', category: 'PC系', memo: 'メモA' });
+
+  const ids = Object.keys(spreadsheetsById);
+  assert.strictEqual(ids.length, 1, 'スプレッドシートが1つだけ作られる');
+  const rows = spreadsheetsById[ids[0]]._sheet._rows;
+  assert.strictEqual(rows.length, 2, 'ヘッダ行 + データ1行');
+  // vm(別レルム)の配列と比較するため、prototypeを問わない Array.from で正規化してから比較する
+  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
+  assert.strictEqual(rows[1][1], 'PC系');
+  assert.strictEqual(rows[1][2], '索引テスト記事'); // HYPERLINKの表示値(タイトル)
+  assert.strictEqual(rows[1][3], 'https://example.com/idx');
+  assert.strictEqual(rows[1][4], 'メモA');
+});
+
+test('インデックス: 2回目以降の保存はスプレッドシートを作り直さず追記する', () => {
+  const { context, spreadsheetsById } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/1', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/2', category: 'DTP系' });
+
+  assert.strictEqual(Object.keys(spreadsheetsById).length, 1, 'スプレッドシートは1つのまま');
+  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
+  assert.strictEqual(rows.length, 3, 'ヘッダ + データ2行');
+});
+
+test('一覧API: 指定カテゴリの保存済み記事のみを新しい順に返す', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/pc1', category: 'PC系', memo: '1件目' });
+  callDoPost(context, { url: 'https://example.com/dtp1', category: 'DTP系' });
+  callDoPost(context, { url: 'https://example.com/pc2', category: 'PC系', memo: '2件目' });
+
+  const result = callDoGetList(context, 'PC系');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 2, 'PC系のみ2件');
+  // 新しい順（後に保存したpc2が先頭）
+  assert.strictEqual(result.items[0].url, 'https://example.com/pc2');
+  assert.strictEqual(result.items[0].memo, '2件目');
+  assert.strictEqual(result.items[1].url, 'https://example.com/pc1');
+});
+
+test('一覧API: まだ何も保存されていないカテゴリは空配列を返す（エラーにしない）', () => {
+  const { context } = loadGasScript();
+  const result = callDoGetList(context, 'TOCO/お知らせ');
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.items, []);
+});
+
+test('一覧API: 不明なカテゴリはエラーを返す', () => {
+  const { context } = loadGasScript();
+  const result = callDoGetList(context, '../etc');
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /不明なカテゴリです/);
+});
+
+test('一覧API: category未指定はエラーを返す', () => {
+  const { context } = loadGasScript();
+  const result = callDoGetList(context, undefined);
+  assert.strictEqual(result.ok, false);
+});
+
+test('doGet: action未指定は稼働確認メッセージを返す（一覧処理に入らない）', () => {
+  const { context } = loadGasScript();
+  const output = context.doGet({ parameter: {} });
+  const result = JSON.parse(output.getContent());
+  assert.strictEqual(result.ok, true);
+  assert.match(result.message, /稼働中/);
+});
+
+test('doGet: eが空でも落ちない', () => {
+  const { context } = loadGasScript();
+  const output = context.doGet(undefined);
+  const result = JSON.parse(output.getContent());
+  assert.strictEqual(result.ok, true);
+});
+
+test('escapeFormulaString_: ダブルクォートが二重化される（数式インジェクション対策）', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(
+    context.escapeFormulaString_('タイトルに"引用符"あり'),
+    'タイトルに""引用符""あり'
+  );
+});
+
+test('インデックス追記が失敗しても doPost 自体は成功として返す（本体保存を優先）', () => {
+  const { context, rootFolder } = loadGasScript();
+  // SpreadsheetApp.create を壊して、インデックス追記だけ失敗させる
+  context.SpreadsheetApp.create = () => { throw new Error('スタブ: 意図的な失敗'); };
+
+  const result = callDoPost(context, { url: 'https://example.com/x', category: 'PC系' });
+  assert.strictEqual(result.ok, true, 'Markdown保存が成功していればokはtrue');
+  const category = rootFolder.subFolders[0].subFolders[0];
+  assert.strictEqual(category.files.length, 1, 'Markdownファイルは保存されている');
+});
+
+// ---- カテゴリ管理（動的CRUD） -----------------------------------
+
+test('categories API: 初回アクセスでデフォルト10カテゴリが返る', () => {
+  const { context } = loadGasScript();
+  const result = callDoGetCategories(context);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.categories.length, 10);
+  assert.ok(result.categories.indexOf('PC系') !== -1);
+  assert.match(result.rootFolderUrl, /^https:\/\/drive\.google\.com\/drive\/folders\//);
+});
+
+test('categories API: 2回呼んでも同じ一覧が安定して返る（毎回初期化されない）', () => {
+  const { context } = loadGasScript();
+  const first = callDoGetCategories(context);
+  const second = callDoGetCategories(context);
+  assert.deepStrictEqual(Array.from(first.categories), Array.from(second.categories));
+});
+
+test('addCategory: 新しいカテゴリを追加すると一覧に反映され、以後 save でも使える', () => {
+  const { context } = loadGasScript();
+  const added = callDoPost(context, { action: 'addCategory', name: '写真' });
+  assert.strictEqual(added.ok, true);
+  assert.ok(added.categories.indexOf('写真') !== -1);
+
+  const saved = callDoPost(context, { url: 'https://example.com/photo', category: '写真' });
+  assert.strictEqual(saved.ok, true, '追加した直後のカテゴリで保存できる');
+});
+
+test('addCategory: 空名は拒否される', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'addCategory', name: '   ' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /カテゴリ名が指定されていません/);
+});
+
+test('addCategory: 同名カテゴリの重複追加は拒否される', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'addCategory', name: 'PC系' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /同名のカテゴリが既にあります/);
+});
+
+test('addCategory: 名前に / や \\ が含まれる場合は・に置換される（Driveフォルダ名対策）', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'addCategory', name: 'A/B\\C' });
+  assert.strictEqual(result.ok, true);
+  assert.ok(result.categories.indexOf('A・B・C') !== -1);
+});
+
+test('removeCategory: 削除すると一覧から消えるが、既存のDriveファイル・Sheets行は残る', () => {
+  const { context, rootFolder } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/old', category: 'PC系', memo: '削除前に保存' });
+
+  const removed = callDoPost(context, { action: 'removeCategory', name: 'PC系' });
+  assert.strictEqual(removed.ok, true);
+  assert.strictEqual(removed.categories.indexOf('PC系'), -1);
+
+  // 新規保存はもうできない（選択肢から外れている）
+  const saveAfterRemove = callDoPost(context, { url: 'https://example.com/new', category: 'PC系' });
+  assert.strictEqual(saveAfterRemove.ok, false);
+
+  // 削除前に保存したDrive上のファイルは残っている（非破壊）
+  const knowledge = rootFolder.subFolders.find((f) => f.name === 'ナレッジ');
+  const pcFolder = knowledge.subFolders.find((f) => f.name === 'PC系');
+  assert.ok(pcFolder, 'カテゴリフォルダ自体は削除されない');
+  assert.strictEqual(pcFolder.files.length, 1, '保存済みファイルは残る');
+});
+
+test('removeCategory: 存在しないカテゴリの削除はエラー', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'removeCategory', name: '存在しないカテゴリ' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /存在しないカテゴリです/);
+});
+
+test('doPost: 不明なactionはエラーになる', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'destroyEverything' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /不明なactionです/);
+});
+
+test('doPost: addCategory/removeCategoryもSHARED_TOKEN検証の対象になる', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const result = callDoPost(context, { action: 'addCategory', name: '写真', token: 'wrong' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('DEFAULT_CATEGORIES: 元の10カテゴリがそのまま定義されている（回帰確認）', () => {
+  const { context } = loadGasScript();
+  assert.deepStrictEqual(Array.from(context.DEFAULT_CATEGORIES), [
+    '業務マニュアル', '自由掲示板', 'PC系', 'DTP系', 'その他PC学習、スキル',
+    'PCニュース', '語学系', '英語・中国語', 'レシピ、お店', 'TOCO/お知らせ'
+  ]);
+});
+
+// ---- URL解決（短縮/リダイレクトリンク対策） -----------------------
+
+test('resolveFinalUrl_: リダイレクトが無ければ元のURLをそのまま返す', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ code: 200, body: 'ok' })
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://example.com/'), 'https://example.com/');
+});
+
+test('resolveFinalUrl_: 302リダイレクトを1回辿って実URLへ解決する', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => {
+      if (url === 'https://short.example/abc') {
+        return makeFetchResponse({ code: 302, headers: { Location: 'https://real.example/article' } });
+      }
+      return makeFetchResponse({ code: 200 });
+    }
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://short.example/abc'), 'https://real.example/article');
+});
+
+test('resolveFinalUrl_: リダイレクトが上限回数を超えたら最後に辿り着いたURLで打ち切る', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => {
+      const n = Number(url.split('/').pop());
+      return makeFetchResponse({ code: 302, headers: { Location: 'https://loop.example/' + (n + 1) } });
+    }
+  });
+  // MAX_REDIRECT_HOPS=5 なので、0→1→2→3→4→5 と5回転送を辿った時点で打ち切られる
+  assert.strictEqual(context.resolveFinalUrl_('https://loop.example/0'), 'https://loop.example/5');
+});
+
+test('resolveFinalUrl_: Locationヘッダが無い3xxはその時点のURLで打ち切る', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ code: 301, headers: {} })
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://example.com/'), 'https://example.com/');
+});
+
+test('resolveFinalUrl_: 通信エラー時はその時点のURLを返す（例外を投げない）', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => { throw new Error('timeout'); }
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://example.com/'), 'https://example.com/');
+});
+
+test('resolveRelativeUrl_: 絶対URLのLocationはそのまま返す', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(
+    context.resolveRelativeUrl_('https://a.example/x', 'https://b.example/y'),
+    'https://b.example/y'
+  );
+});
+
+test('resolveRelativeUrl_: /始まりの相対パスはoriginと結合する', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(
+    context.resolveRelativeUrl_('https://a.example/x/y', '/z'),
+    'https://a.example/z'
+  );
+});
+
+test('doPost: 短縮/リダイレクトURLは実URLに解決されてからDrive・Sheetsに保存される', () => {
+  const { context, rootFolder, spreadsheetsById } = loadGasScript({
+    fetchImpl: (url) => {
+      if (url === 'https://short.example/abc') {
+        return makeFetchResponse({ code: 302, headers: { Location: 'https://real.example/article' } });
+      }
+      return makeFetchResponse({ body: '<title>実記事タイトル</title><p>本文だよ</p>' });
+    }
+  });
+
+  const result = callDoPost(context, { url: 'https://short.example/abc', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.title, '実記事タイトル');
+
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.match(file.content, /- URL: https:\/\/real\.example\/article/);
+  assert.match(file.content, /共有時のURL（短縮\/リダイレクト元）: https:\/\/short\.example\/abc/);
+
+  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
+  assert.strictEqual(rows[1][3], 'https://real.example/article', 'Sheets側のURL列も解決後のURL');
+});
+
+test('doPost: リダイレクトが無いURLでは「共有時のURL」行を出さない', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>直リンク記事</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/direct', category: 'PC系' });
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.doesNotMatch(file.content, /共有時のURL/);
+});
+
+// ---- 本文自動抽出 -----------------------------------------------
+
+test('extractBodyText_: script/styleを除去し、タグを剥がしてテキスト化する', () => {
+  const { context } = loadGasScript();
+  const html = '<html><head><style>.a{color:red}</style><script>alert(1)</script></head>' +
+    '<body><h1>見出し</h1><p>本文1行目です。</p><p>本文2行目です。</p></body></html>';
+  const text = context.extractBodyText_(html);
+  assert.doesNotMatch(text, /alert\(1\)/);
+  assert.doesNotMatch(text, /color:red/);
+  assert.match(text, /見出し/);
+  assert.match(text, /本文1行目です。/);
+  assert.match(text, /本文2行目です。/);
+});
+
+test('extractBodyText_: 長すぎる本文はBODY_TEXT_MAXで切り詰められる', () => {
+  const { context } = loadGasScript();
+  const html = '<p>' + 'あ'.repeat(6000) + '</p>';
+  const text = context.extractBodyText_(html);
+  assert.ok(text.length < 4100, '切り詰められている: ' + text.length);
+  assert.match(text, /…（以下省略）$/);
+});
+
+test('extractBodyText_: 空HTMLは空文字を返す', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.extractBodyText_(''), '');
+});
+
+test('doPost: 抽出した本文がMarkdownの「本文」節に反映される', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>本文付き記事</title><p>これは本文です。</p>' })
+  });
+  const result = callDoPost(context, { url: 'https://example.com/body-test', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.match(file.content, /## 本文（自動抽出・参考）/);
+  assert.match(file.content, /これは本文です。/);
+});
+
+// ---- メモ重複排除（タイトルと同一のメモを捨てる） -------------------
+
+test('isDuplicateMemo_: メモとタイトルが完全一致なら重複と判定される', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('同じ文字列', '同じ文字列'), true);
+});
+
+test('isDuplicateMemo_: 前後の空白差は無視して重複判定する', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('  同じ文字列  ', '同じ文字列'), true);
+});
+
+test('isDuplicateMemo_: 内容が異なれば重複ではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('あとで読む', 'タイトル'), false);
+});
+
+test('isDuplicateMemo_: 空メモは重複ではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('', 'タイトル'), false);
+});
+
+test('doPost: メモがタイトルと同一なら「メモ」節を出さない（重複防止）', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>同じ内容</title>' })
+  });
+  const result = callDoPost(context, { url: 'https://example.com/dup', category: 'PC系', memo: '同じ内容' });
+  assert.strictEqual(result.ok, true);
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.doesNotMatch(file.content, /## メモ/);
+});
+
+test('doPost: メモがタイトルと異なれば通常通り「メモ」節を出す', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>タイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/diff', category: 'PC系', memo: '別のコメント' });
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.match(file.content, /## メモ\n\n別のコメント/);
+});
+
+// ---- Google Docs形式での保存 --------------------------------------
+// プレーンテキスト/Markdown（text/markdown）はクラウド版Claudeの Google Drive
+// 連携が直接読めるMIMEタイプに含まれないため、Google Docsネイティブ形式で保存する。
+
+test('doPost: 記事はGoogleドキュメント（DocumentApp）として作成される', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>Docs形式テスト</title><p>本文</p>' })
+  });
+  const result = callDoPost(context, { url: 'https://example.com/docs-test', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.strictEqual(file._isDoc, true, 'createFileではなくDocumentApp.createで作られている');
+  assert.strictEqual(file.mimeType, 'application/vnd.google-apps.document');
+  assert.match(file.getUrl(), /^https:\/\/docs\.google\.com\/document\/d\//);
+});
+
+test('doPost: Sheetsインデックスの「Driveファイル」列にドキュメントへのHYPERLINKが入る', () => {
+  const { context, spreadsheetsById } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>索引にファイルリンク</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/index-file-link', category: 'PC系' });
+
+  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
+  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
+  assert.strictEqual(rows[1][5], '開く', 'Driveファイル列はHYPERLINKの表示値「開く」になる');
+});
+
+test('doPost: 同名記事の重複判定はGoogleドキュメントに対しても機能する（上書き防止）', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>重複タイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/dup-a', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/dup-b', category: 'PC系' });
+
+  const files = rootFolder.subFolders[0].subFolders[0].files;
+  assert.strictEqual(files.length, 2, '2件ともドキュメントとして保存される');
+  assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名（ドキュメントのタイトル）が衝突しない');
 });

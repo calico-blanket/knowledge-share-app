@@ -82,19 +82,24 @@ test('http:// のURLも受け付ける', () => {
   assert.strictEqual(result.url, 'http://old-site.example/page');
 });
 
-test('カテゴリ一覧: index.html と gas/Code.gs の CATEGORIES が完全一致する', () => {
-  // 片方だけ変更してカテゴリがズレる事故を防ぐ整合性チェック
+test('カテゴリ管理: index.html にカテゴリのハードコード配列が無い（GASから動的取得する設計を保つ）', () => {
+  // 以前は index.html 側にも固定のカテゴリ配列があり、GAS側と手動で同期する必要があった。
+  // 今はカテゴリをGASのスクリプトプロパティで一元管理し、PWAは起動時に action=categories で
+  // 取得する設計に変更したため、index.html に固定配列が復活していないことを回帰確認する。
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const gas = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
+  assert.doesNotMatch(html, /var CATEGORIES\s*=\s*\[/);
+  assert.match(html, /fetchCategories/, 'カテゴリを動的取得する関数が存在すること');
+  assert.match(html, /gasGet\('categories'\)/, 'GASのcategoriesエンドポイントを呼んでいること');
+});
 
-  const extract = (source, label) => {
-    const m = source.match(/var CATEGORIES = \[([\s\S]*?)\]/);
-    assert.ok(m, label + ' に CATEGORIES 定義があること');
-    return m[1].match(/'([^']+)'/g).map((s) => s.slice(1, -1));
-  };
-
-  const htmlCategories = extract(html, 'index.html');
-  const gasCategories = extract(gas, 'gas/Code.gs');
-  assert.deepStrictEqual(htmlCategories, gasCategories);
-  assert.strictEqual(htmlCategories.length, 10, 'カテゴリは10件');
+test('新機能のUI要素: 一覧・カテゴリ管理・Driveショートカットに必要なDOM idが揃っている', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var requiredIds = [
+    'driveShortcutButton', 'listButton', 'listCategoryView', 'listCategoryGrid',
+    'listItemsView', 'listItemsContainer', 'categoryManageSection', 'categoryManageList',
+    'newCategoryInput', 'addCategoryButton', 'titleHintRow', 'titleHintText'
+  ];
+  requiredIds.forEach(function (id) {
+    assert.match(html, new RegExp('id="' + id + '"'), 'id="' + id + '" が存在すること');
+  });
 });
