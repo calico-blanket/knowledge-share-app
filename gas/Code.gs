@@ -178,25 +178,37 @@ function parseJsonBody_(e) {
 function handleSave_(body) {
   var params = validateSaveParams_(body);
 
-  // ステップ1: ページタイトルの自動取得（失敗時は URL をそのまま使う）
-  var title = fetchPageTitle_(params.url);
+  // ステップ1: 共有された URL を実URLへ解決する
+  // （Androidの共有機能が生成する share.google 等の短縮/リダイレクトリンクのままだと、
+  //   後で人間やAIが開く際に不便な上、短縮リンクは将来失効するリスクもあるため）
+  var resolvedUrl = resolveFinalUrl_(params.url);
 
-  // ステップ2: Drive のカテゴリフォルダへ Markdown ファイルとして保存
-  var saved = saveToDrive_(params.category, params.url, title, params.memo);
+  // ステップ2: ページのタイトルと本文テキストを取得（失敗時はタイトル=URL、本文=空）
+  var details = fetchPageDetails_(resolvedUrl);
 
-  // ステップ3: 検索用インデックス（Sheets）に1行追記する
+  // ステップ3: メモがタイトルと重複している場合は捨てる
+  // （Android共有時に「タイトル文字列」がそのままメモ扱いで送られてくることが多く、
+  //   タイトルと同じ内容が本文中に二重表示されるのを防ぐ）
+  var memo = isDuplicateMemo_(params.memo, details.title) ? '' : params.memo;
+
+  // ステップ4: Drive のカテゴリフォルダへ Markdown ファイルとして保存
+  var saved = saveToDrive_(
+    params.category, resolvedUrl, details.title, memo, details.bodyText, params.url
+  );
+
+  // ステップ5: 検索用インデックス（Sheets）に1行追記する
   // インデックスへの追記に失敗しても、Markdown本体の保存は成功しているため
   // ユーザーには成功として返す（インデックスは検索補助であり本体ではない）
   try {
     var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
-    appendIndexRow_(rootFolder, saved.savedAt, params.category, title, params.url, params.memo);
+    appendIndexRow_(rootFolder, saved.savedAt, params.category, details.title, resolvedUrl, memo);
   } catch (indexErr) {
     console.error('インデックスへの追記に失敗しました: ' + indexErr);
   }
 
   return {
     ok: true,
-    title: title,
+    title: details.title,
     fileName: saved.fileName,
     folderPath: ROOT_FOLDER_NAME + '/' + params.category
   };
@@ -341,24 +353,84 @@ function checkToken_(token) {
   }
 }
 
-// ---- タイトル取得 -------------------------------------------
+// ---- URL解決 --------------------------------------------------
+
+// 一般的なブラウザに近い UA を名乗る（ボット扱いで拒否されるサイト対策）
+var DEFAULT_USER_AGENT = 'Mozilla/5.0 (Linux; Android 14) KnowledgeShareBot/1.0';
+
+// リダイレクト解決の最大ホップ数（無限リダイレクト対策）
+var MAX_REDIRECT_HOPS = 5;
 
 /**
- * URL 先のページからタイトルを取得する。
- * <title> → og:title の順で探し、どちらも取れなければ URL を返す。
- * 通信エラー・タイムアウト等はすべて握りつぶして URL フォールバック。
+ * 短縮/リダイレクトリンク（share.google 等）を実際の記事URLへ解決する。
+ * 3xxレスポンスの Location ヘッダを最大 MAX_REDIRECT_HOPS 回まで辿る。
+ * 解決できなければ（通信エラー・Locationヘッダ無し等）、その時点のURLを返す。
  */
-function fetchPageTitle_(url) {
+function resolveFinalUrl_(url) {
+  var currentUrl = url;
+  for (var i = 0; i < MAX_REDIRECT_HOPS; i++) {
+    var response;
+    try {
+      response = UrlFetchApp.fetch(currentUrl, {
+        muteHttpExceptions: true,
+        followRedirects: false,
+        headers: { 'User-Agent': DEFAULT_USER_AGENT }
+      });
+    } catch (fetchErr) {
+      return currentUrl;
+    }
+
+    var code = response.getResponseCode();
+    if (code < 300 || code >= 400) {
+      return currentUrl;
+    }
+
+    var headers = response.getHeaders();
+    var location = headers['Location'] || headers['location'];
+    if (!location) {
+      return currentUrl;
+    }
+    currentUrl = resolveRelativeUrl_(currentUrl, location);
+  }
+  return currentUrl;
+}
+
+/**
+ * Location ヘッダの値（絶対URLとは限らない）を、遷移元URLを基準に絶対URLへ直す純粋関数。
+ */
+function resolveRelativeUrl_(baseUrl, location) {
+  if (/^https?:\/\//i.test(location)) {
+    return location;
+  }
+  var m = baseUrl.match(/^(https?:\/\/[^/]+)/i);
+  var origin = m ? m[1] : '';
+  if (location.charAt(0) === '/') {
+    return origin + location;
+  }
+  return origin + '/' + location;
+}
+
+// ---- タイトル・本文取得 -----------------------------------------
+
+// 本文自動抽出の最大文字数（ファイルサイズ・実行時間対策の簡易上限）
+var BODY_TEXT_MAX = 4000;
+
+/**
+ * URL 先のページからタイトルと本文テキストを取得する。
+ * タイトルは <title> → og:title の順、どちらも取れなければ URL をタイトル代わりに使う。
+ * 本文は簡易的なHTML→テキスト変換（ナビ・広告等の除去は行わない素朴な実装）。
+ * 通信エラー・タイムアウト等はすべて握りつぶし、タイトル=URL・本文=空 で返す。
+ */
+function fetchPageDetails_(url) {
   try {
     var response = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
       followRedirects: true,
-      // 一般的なブラウザに近い UA を名乗る（ボット扱いで拒否されるサイト対策）
-      headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14) KnowledgeShareBot/1.0' }
+      headers: { 'User-Agent': DEFAULT_USER_AGENT }
     });
 
     if (response.getResponseCode() >= 400) {
-      return url;
+      return { title: url, bodyText: '' };
     }
 
     // 文字コードの判定: Content-Type ヘッダ → meta タグ の順で charset を探す
@@ -369,11 +441,12 @@ function fetchPageTitle_(url) {
       html = response.getContentText(charset);
     }
 
-    var title = extractTitle_(html);
-    return title || url;
+    var title = extractTitle_(html) || url;
+    var bodyText = extractBodyText_(html);
+    return { title: title, bodyText: bodyText };
   } catch (fetchErr) {
     // 取得失敗時は URL そのものをタイトル代わりに使う（仕様のフォールバック）
-    return url;
+    return { title: url, bodyText: '' };
   }
 }
 
@@ -441,14 +514,61 @@ function decodeEntities_(text) {
     .replace(/&amp;/g, '&'); // &amp; は最後に戻す（二重デコード防止）
 }
 
+/**
+ * HTML から本文らしきテキストを抽出する純粋関数。
+ * script/style/コメントを除去し、ブロック要素の境目で改行を入れてから
+ * 残りのタグを剥がす素朴な実装（ナビ・広告等を判別して除去する高度な
+ * 抽出（Readability相当）ではない点に注意。X/Twitter等JS描画に依存する
+ * サイトでは本文がほぼ取れないことがある）。
+ * 長すぎる場合は BODY_TEXT_MAX で打ち切る。
+ */
+function extractBodyText_(html) {
+  if (!html) {
+    return '';
+  }
+
+  var text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    // ブロック要素の開始位置に改行を入れる（タグを剥がした後も段落感を残すため）
+    .replace(/<(br|p|div|li|h[1-6]|tr)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' '); // 残りのタグをすべて除去
+
+  text = decodeEntities_(text);
+  text = text
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (text.length > BODY_TEXT_MAX) {
+    text = text.substring(0, BODY_TEXT_MAX) + '…（以下省略）';
+  }
+  return text;
+}
+
+/**
+ * メモがタイトルと実質同じ内容かどうかを判定する純粋関数。
+ * Android共有時に「タイトル文字列」がそのままメモとして送られてくることが多く、
+ * それをそのまま保存すると本文とメモが同じ内容の二重表示になるため、判定して除外する。
+ */
+function isDuplicateMemo_(memo, title) {
+  var normalizedMemo = String(memo || '').trim();
+  var normalizedTitle = String(title || '').trim();
+  return !!normalizedMemo && normalizedMemo === normalizedTitle;
+}
+
 // ---- Drive 保存 ---------------------------------------------
 
 /**
  * 「ナレッジ/<カテゴリ名>/」フォルダ（無ければ自動作成）に
  * 1記事1ファイルの Markdown として保存する。
+ * url は解決済みの実URL、originalUrl は共有時点の（短縮/リダイレクトの可能性がある）URL。
+ * 両者が同じ場合、Markdown内に共有元URLの行は出さない。
  * 戻り値: { fileName: 実際に保存したファイル名, fileId: DriveのファイルID }
  */
-function saveToDrive_(category, url, title, memo) {
+function saveToDrive_(category, url, title, memo, bodyText, originalUrl) {
   // ステップ1: ルートフォルダ「ナレッジ」を取得（無ければ作成）
   var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
 
@@ -469,7 +589,7 @@ function saveToDrive_(category, url, title, memo) {
 
   // ステップ4: Markdown 本文を組み立てて保存
   var savedAt = Utilities.formatDate(now, TIME_ZONE, 'yyyy-MM-dd HH:mm');
-  var content = buildMarkdown_(title, url, savedAt, category, memo);
+  var content = buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalUrl);
   var file = categoryFolder.createFile(fileName, content, 'text/markdown');
 
   return { fileName: fileName, fileId: file.getId(), savedAt: savedAt };
@@ -515,22 +635,36 @@ function sanitizeFileName_(name) {
 
 /**
  * 保存する Markdown 本文を組み立てる純粋関数。
- * タイトル・URL・保存日時・カテゴリ（+任意のメモ）を含める。
+ * タイトル・URL・保存日時・カテゴリ（+任意のメモ・本文）を含める。
+ * originalUrl が url と異なる場合のみ「共有時のURL」行を追加する
+ * （share.google 等の短縮/リダイレクトリンクだった場合の記録用）。
  */
-function buildMarkdown_(title, url, savedAt, category, memo) {
+function buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalUrl) {
   var lines = [
     '# ' + title,
     '',
-    '- URL: ' + url,
-    '- 保存日時: ' + savedAt,
-    '- カテゴリ: ' + category
+    '- URL: ' + url
   ];
+  if (originalUrl && originalUrl !== url) {
+    lines.push('- 共有時のURL（短縮/リダイレクト元）: ' + originalUrl);
+  }
+  lines.push('- 保存日時: ' + savedAt);
+  lines.push('- カテゴリ: ' + category);
+
   if (memo) {
     lines.push('');
     lines.push('## メモ');
     lines.push('');
     lines.push(memo);
   }
+
+  if (bodyText) {
+    lines.push('');
+    lines.push('## 本文（自動抽出・参考）');
+    lines.push('');
+    lines.push(bodyText);
+  }
+
   lines.push('');
   return lines.join('\n');
 }

@@ -637,3 +637,175 @@ test('DEFAULT_CATEGORIES: 元の10カテゴリがそのまま定義されてい�
     'PCニュース', '語学系', '英語・中国語', 'レシピ、お店', 'TOCO/お知らせ'
   ]);
 });
+
+// ---- URL解決（短縮/リダイレクトリンク対策） -----------------------
+
+test('resolveFinalUrl_: リダイレクトが無ければ元のURLをそのまま返す', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ code: 200, body: 'ok' })
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://example.com/'), 'https://example.com/');
+});
+
+test('resolveFinalUrl_: 302リダイレクトを1回辿って実URLへ解決する', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => {
+      if (url === 'https://short.example/abc') {
+        return makeFetchResponse({ code: 302, headers: { Location: 'https://real.example/article' } });
+      }
+      return makeFetchResponse({ code: 200 });
+    }
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://short.example/abc'), 'https://real.example/article');
+});
+
+test('resolveFinalUrl_: リダイレクトが上限回数を超えたら最後に辿り着いたURLで打ち切る', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => {
+      const n = Number(url.split('/').pop());
+      return makeFetchResponse({ code: 302, headers: { Location: 'https://loop.example/' + (n + 1) } });
+    }
+  });
+  // MAX_REDIRECT_HOPS=5 なので、0→1→2→3→4→5 と5回転送を辿った時点で打ち切られる
+  assert.strictEqual(context.resolveFinalUrl_('https://loop.example/0'), 'https://loop.example/5');
+});
+
+test('resolveFinalUrl_: Locationヘッダが無い3xxはその時点のURLで打ち切る', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ code: 301, headers: {} })
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://example.com/'), 'https://example.com/');
+});
+
+test('resolveFinalUrl_: 通信エラー時はその時点のURLを返す（例外を投げない）', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => { throw new Error('timeout'); }
+  });
+  assert.strictEqual(context.resolveFinalUrl_('https://example.com/'), 'https://example.com/');
+});
+
+test('resolveRelativeUrl_: 絶対URLのLocationはそのまま返す', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(
+    context.resolveRelativeUrl_('https://a.example/x', 'https://b.example/y'),
+    'https://b.example/y'
+  );
+});
+
+test('resolveRelativeUrl_: /始まりの相対パスはoriginと結合する', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(
+    context.resolveRelativeUrl_('https://a.example/x/y', '/z'),
+    'https://a.example/z'
+  );
+});
+
+test('doPost: 短縮/リダイレクトURLは実URLに解決されてからDrive・Sheetsに保存される', () => {
+  const { context, rootFolder, spreadsheetsById } = loadGasScript({
+    fetchImpl: (url) => {
+      if (url === 'https://short.example/abc') {
+        return makeFetchResponse({ code: 302, headers: { Location: 'https://real.example/article' } });
+      }
+      return makeFetchResponse({ body: '<title>実記事タイトル</title><p>本文だよ</p>' });
+    }
+  });
+
+  const result = callDoPost(context, { url: 'https://short.example/abc', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.title, '実記事タイトル');
+
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.match(file.content, /- URL: https:\/\/real\.example\/article/);
+  assert.match(file.content, /共有時のURL（短縮\/リダイレクト元）: https:\/\/short\.example\/abc/);
+
+  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
+  assert.strictEqual(rows[1][3], 'https://real.example/article', 'Sheets側のURL列も解決後のURL');
+});
+
+test('doPost: リダイレクトが無いURLでは「共有時のURL」行を出さない', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>直リンク記事</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/direct', category: 'PC系' });
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.doesNotMatch(file.content, /共有時のURL/);
+});
+
+// ---- 本文自動抽出 -----------------------------------------------
+
+test('extractBodyText_: script/styleを除去し、タグを剥がしてテキスト化する', () => {
+  const { context } = loadGasScript();
+  const html = '<html><head><style>.a{color:red}</style><script>alert(1)</script></head>' +
+    '<body><h1>見出し</h1><p>本文1行目です。</p><p>本文2行目です。</p></body></html>';
+  const text = context.extractBodyText_(html);
+  assert.doesNotMatch(text, /alert\(1\)/);
+  assert.doesNotMatch(text, /color:red/);
+  assert.match(text, /見出し/);
+  assert.match(text, /本文1行目です。/);
+  assert.match(text, /本文2行目です。/);
+});
+
+test('extractBodyText_: 長すぎる本文はBODY_TEXT_MAXで切り詰められる', () => {
+  const { context } = loadGasScript();
+  const html = '<p>' + 'あ'.repeat(6000) + '</p>';
+  const text = context.extractBodyText_(html);
+  assert.ok(text.length < 4100, '切り詰められている: ' + text.length);
+  assert.match(text, /…（以下省略）$/);
+});
+
+test('extractBodyText_: 空HTMLは空文字を返す', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.extractBodyText_(''), '');
+});
+
+test('doPost: 抽出した本文がMarkdownの「本文」節に反映される', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>本文付き記事</title><p>これは本文です。</p>' })
+  });
+  const result = callDoPost(context, { url: 'https://example.com/body-test', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.match(file.content, /## 本文（自動抽出・参考）/);
+  assert.match(file.content, /これは本文です。/);
+});
+
+// ---- メモ重複排除（タイトルと同一のメモを捨てる） -------------------
+
+test('isDuplicateMemo_: メモとタイトルが完全一致なら重複と判定される', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('同じ文字列', '同じ文字列'), true);
+});
+
+test('isDuplicateMemo_: 前後の空白差は無視して重複判定する', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('  同じ文字列  ', '同じ文字列'), true);
+});
+
+test('isDuplicateMemo_: 内容が異なれば重複ではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('あとで読む', 'タイトル'), false);
+});
+
+test('isDuplicateMemo_: 空メモは重複ではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isDuplicateMemo_('', 'タイトル'), false);
+});
+
+test('doPost: メモがタイトルと同一なら「メモ」節を出さない（重複防止）', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>同じ内容</title>' })
+  });
+  const result = callDoPost(context, { url: 'https://example.com/dup', category: 'PC系', memo: '同じ内容' });
+  assert.strictEqual(result.ok, true);
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.doesNotMatch(file.content, /## メモ/);
+});
+
+test('doPost: メモがタイトルと異なれば通常通り「メモ」節を出す', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>タイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/diff', category: 'PC系', memo: '別のコメント' });
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.match(file.content, /## メモ\n\n別のコメント/);
+});
