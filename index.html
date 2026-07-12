@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ナレッジ保存</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icons/icon-192.png">
+  <meta name="theme-color" content="#3949ab">
+  <style>
+    /* ============================================================
+       ナレッジ保存 PWA のスタイル
+       スマホ片手操作前提: ボタンは大きく(高さ64px以上)、2列グリッド
+       ============================================================ */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif;
+      background: #f5f6fa;
+      color: #23272f;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #3949ab;
+      color: #fff;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { font-size: 18px; font-weight: 600; }
+    #settingsButton {
+      background: none;
+      border: none;
+      color: #fff;
+      font-size: 22px;
+      cursor: pointer;
+      padding: 4px 8px;
+    }
+
+    main { padding: 16px; max-width: 480px; margin: 0 auto; }
+
+    /* 共有されたURLの表示枠 */
+    .shared-url {
+      background: #fff;
+      border: 1px solid #d7dae3;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      word-break: break-all;
+      color: #4a5060;
+    }
+    .shared-url .label {
+      display: block;
+      font-size: 12px;
+      color: #8a90a0;
+      margin-bottom: 4px;
+    }
+
+    .section-title {
+      font-size: 14px;
+      color: #5a6070;
+      margin-bottom: 10px;
+    }
+
+    /* カテゴリボタン: 2列グリッド、高さ64px以上、押し間違い防止の間隔 */
+    .category-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .category-button {
+      min-height: 64px;
+      border: none;
+      border-radius: 12px;
+      background: #fff;
+      border: 2px solid #c9cede;
+      font-size: 15px;
+      font-weight: 600;
+      color: #2f3650;
+      cursor: pointer;
+      padding: 8px;
+      line-height: 1.3;
+      -webkit-tap-highlight-color: rgba(57, 73, 171, 0.2);
+    }
+    .category-button:active {
+      background: #e8eaf6;
+      border-color: #3949ab;
+    }
+
+    /* 手動入力（テスト用・共有パラメータ無しで開いたとき） */
+    .manual-input {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #c9cede;
+      border-radius: 10px;
+      font-size: 15px;
+      margin-bottom: 16px;
+    }
+
+    /* 設定画面 */
+    .settings-panel { background: #fff; border-radius: 12px; padding: 16px; }
+    .settings-panel label {
+      display: block;
+      font-size: 13px;
+      color: #5a6070;
+      margin: 12px 0 4px;
+    }
+    .settings-panel input {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #c9cede;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .settings-panel .note { font-size: 12px; color: #8a90a0; margin-top: 4px; }
+
+    .primary-button {
+      display: block;
+      width: 100%;
+      min-height: 52px;
+      margin-top: 20px;
+      border: none;
+      border-radius: 10px;
+      background: #3949ab;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* 送信中・完了・エラーの状態表示 */
+    .status-panel {
+      text-align: center;
+      padding: 48px 16px;
+    }
+    .status-panel .icon { font-size: 48px; margin-bottom: 16px; }
+    .status-panel .message { font-size: 16px; line-height: 1.6; }
+    .status-panel .detail {
+      font-size: 13px;
+      color: #6a7080;
+      margin-top: 12px;
+      word-break: break-all;
+    }
+    .status-panel.error .message { color: #c62828; }
+
+    .hidden { display: none; }
+
+    /* 送信中のスピナー */
+    .spinner {
+      width: 40px;
+      height: 40px;
+      margin: 0 auto 16px;
+      border: 4px solid #d7dae3;
+      border-top-color: #3949ab;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ナレッジ保存</h1>
+    <button id="settingsButton" type="button" aria-label="設定">⚙</button>
+  </header>
+
+  <main>
+    <!-- ビュー1: カテゴリ選択（メイン画面） -->
+    <div id="mainView" class="hidden">
+      <div class="shared-url">
+        <span class="label">保存する記事</span>
+        <span id="sharedUrlText"></span>
+      </div>
+      <!-- 共有パラメータ無しで開いたとき用の手動入力欄 -->
+      <input id="manualUrlInput" class="manual-input hidden" type="url"
+             placeholder="https:// で始まるURLを入力（テスト用）">
+      <p class="section-title">カテゴリを選んで保存</p>
+      <div id="categoryGrid" class="category-grid"></div>
+    </div>
+
+    <!-- ビュー2: 設定画面（初回起動時・⚙タップ時） -->
+    <div id="settingsView" class="hidden">
+      <div class="settings-panel">
+        <p class="section-title">はじめに設定してください</p>
+        <label for="gasUrlInput">GAS WebアプリのURL</label>
+        <input id="gasUrlInput" type="url" placeholder="https://script.google.com/macros/s/…/exec">
+        <p class="note">GASを「ウェブアプリ」としてデプロイしたときのURLです</p>
+        <label for="tokenInput">合言葉（GASのSHARED_TOKENと同じ値）</label>
+        <input id="tokenInput" type="text" placeholder="設定した合言葉">
+        <p class="note">GAS側で未設定なら空欄でかまいません</p>
+        <button id="saveSettingsButton" class="primary-button" type="button">保存する</button>
+      </div>
+    </div>
+
+    <!-- ビュー3: 送信中 -->
+    <div id="sendingView" class="status-panel hidden">
+      <div class="spinner"></div>
+      <p class="message">保存しています…</p>
+    </div>
+
+    <!-- ビュー4: 完了 -->
+    <div id="doneView" class="status-panel hidden">
+      <div class="icon">✅</div>
+      <p class="message">保存しました！<br>この画面は閉じてOKです</p>
+      <p id="doneDetail" class="detail"></p>
+    </div>
+
+    <!-- ビュー5: エラー -->
+    <div id="errorView" class="status-panel error hidden">
+      <div class="icon">⚠️</div>
+      <p class="message">保存に失敗しました</p>
+      <p id="errorDetail" class="detail"></p>
+      <button id="retryButton" class="primary-button" type="button">カテゴリ選択に戻る</button>
+    </div>
+  </main>
+
+  <script>
+    'use strict';
+
+    // ============================================================
+    // 定数・設定
+    // ============================================================
+
+    // カテゴリ一覧（GAS側 Code.gs の CATEGORIES と必ず一致させること）
+    var CATEGORIES = [
+      '業務マニュアル',
+      '自由掲示板',
+      'PC系',
+      'DTP系',
+      'その他PC学習、スキル',
+      'PCニュース',
+      '語学系',
+      '英語・中国語',
+      'レシピ、お店',
+      'TOCO/お知らせ'
+    ];
+
+    // localStorage に保存する設定のキー
+    var SETTINGS_KEY = 'knowledgeShareSettings';
+
+    // ============================================================
+    // 共有パラメータの解析（純粋関数・テスト対象）
+    // ============================================================
+    // @shared-logic-start
+
+    /**
+     * 共有シート経由で渡されたクエリ文字列から、保存対象のURLとメモを取り出す。
+     *
+     * Androidの共有シートはアプリによって url / text / title のどこに
+     * URLを入れるかが揺れる（Chromeは text に入れることが多い）ため、
+     * shared_url → shared_text → shared_title の順にURLを探す。
+     * shared_text からURLを除いた残りは、ユーザーの一言コメントとして扱う。
+     *
+     * @param {string} queryString - location.search の文字列（例: "?shared_text=..."）
+     * @returns {{url: string, memo: string}} 見つからなければ url は空文字
+     */
+    function parseSharedParams(queryString) {
+      var params = new URLSearchParams(queryString || '');
+      var sharedUrl = params.get('shared_url') || '';
+      var sharedText = params.get('shared_text') || '';
+      var sharedTitle = params.get('shared_title') || '';
+
+      // URLらしき文字列を抜き出す正規表現（http/https のみ）
+      var urlPattern = /https?:\/\/[^\s"'<>]+/;
+
+      var url = '';
+      var memo = '';
+
+      // 優先順1: shared_url がそのままURLならそれを使う
+      var m = sharedUrl.match(urlPattern);
+      if (m) {
+        url = m[0];
+        memo = sharedText.replace(urlPattern, '').trim();
+      } else {
+        // 優先順2: shared_text の中からURLを探す（残りはメモとして扱う）
+        m = sharedText.match(urlPattern);
+        if (m) {
+          url = m[0];
+          memo = sharedText.replace(m[0], '').trim();
+        } else {
+          // 優先順3: shared_title の中からURLを探す
+          m = sharedTitle.match(urlPattern);
+          if (m) {
+            url = m[0];
+            memo = sharedText.trim();
+          }
+        }
+      }
+
+      return { url: url, memo: memo };
+    }
+    // @shared-logic-end
+
+    // ============================================================
+    // 設定の読み書き（localStorage）
+    // ============================================================
+
+    /** 保存済み設定を読む。無ければ null を返す */
+    function loadSettings() {
+      try {
+        var raw = localStorage.getItem(SETTINGS_KEY);
+        if (!raw) { return null; }
+        var settings = JSON.parse(raw);
+        if (!settings || !settings.gasUrl) { return null; }
+        return settings;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    /** 設定を保存する */
+    function saveSettings(gasUrl, token) {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify({ gasUrl: gasUrl, token: token }));
+    }
+
+    // ============================================================
+    // 画面の切り替え
+    // ============================================================
+
+    var VIEW_IDS = ['mainView', 'settingsView', 'sendingView', 'doneView', 'errorView'];
+
+    /** 指定したビューだけを表示し、他は隠す */
+    function showView(viewId) {
+      VIEW_IDS.forEach(function (id) {
+        document.getElementById(id).classList.toggle('hidden', id !== viewId);
+      });
+    }
+
+    // ============================================================
+    // 保存処理（GAS WebアプリへPOST）
+    // ============================================================
+
+    /**
+     * カテゴリボタンが押されたときの保存処理。
+     * Content-Type を text/plain にすることで CORS のプリフライトを回避する
+     * （GAS Webアプリは OPTIONS リクエストに応答できないため）。
+     */
+    async function submitToGas(url, category, memo) {
+      var settings = loadSettings();
+      if (!settings) {
+        showView('settingsView');
+        return;
+      }
+
+      showView('sendingView');
+
+      try {
+        var response = await fetch(settings.gasUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            url: url,
+            category: category,
+            memo: memo,
+            token: settings.token || ''
+          })
+        });
+
+        var result = await response.json();
+
+        if (result.ok) {
+          document.getElementById('doneDetail').textContent =
+            result.folderPath + ' に「' + result.fileName + '」を保存';
+          showView('doneView');
+          // 共有シートから開かれたウィンドウなら閉じられる場合がある（失敗しても無害）
+          setTimeout(function () { window.close(); }, 1500);
+        } else {
+          throw new Error(result.error || '原因不明のエラー');
+        }
+      } catch (err) {
+        console.error('保存に失敗しました:', err);
+        document.getElementById('errorDetail').textContent = String(err.message || err);
+        showView('errorView');
+      }
+    }
+
+    // ============================================================
+    // 初期化
+    // ============================================================
+
+    /** 現在の保存対象URLを返す（共有パラメータ優先、無ければ手動入力欄） */
+    function getCurrentUrl() {
+      var shared = parseSharedParams(location.search);
+      if (shared.url) { return shared.url; }
+      return document.getElementById('manualUrlInput').value.trim();
+    }
+
+    function init() {
+      var shared = parseSharedParams(location.search);
+      var settings = loadSettings();
+
+      // ステップ1: カテゴリボタンを生成
+      var grid = document.getElementById('categoryGrid');
+      CATEGORIES.forEach(function (category) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'category-button';
+        button.textContent = category;
+        button.addEventListener('click', function () {
+          var url = getCurrentUrl();
+          if (!url) {
+            alert('URLがありません。共有シートから開くか、URLを入力してください。');
+            return;
+          }
+          submitToGas(url, category, shared.memo);
+        });
+        grid.appendChild(button);
+      });
+
+      // ステップ2: 共有されたURLの表示（無ければ手動入力欄を出す）
+      if (shared.url) {
+        document.getElementById('sharedUrlText').textContent = shared.url;
+      } else {
+        document.getElementById('sharedUrlText').textContent =
+          '共有シートから開くとURLが自動で入ります';
+        document.getElementById('manualUrlInput').classList.remove('hidden');
+      }
+
+      // ステップ3: 設定の有無で最初の画面を決める
+      if (settings) {
+        showView('mainView');
+      } else {
+        showView('settingsView');
+      }
+
+      // ステップ4: 設定画面のイベント登録
+      document.getElementById('settingsButton').addEventListener('click', function () {
+        var current = loadSettings() || { gasUrl: '', token: '' };
+        document.getElementById('gasUrlInput').value = current.gasUrl;
+        document.getElementById('tokenInput').value = current.token || '';
+        showView('settingsView');
+      });
+
+      document.getElementById('saveSettingsButton').addEventListener('click', function () {
+        var gasUrl = document.getElementById('gasUrlInput').value.trim();
+        var token = document.getElementById('tokenInput').value.trim();
+        if (!/^https:\/\/script\.google\.com\/.+/.test(gasUrl)) {
+          alert('GAS WebアプリのURL（https://script.google.com/…）を入力してください');
+          return;
+        }
+        saveSettings(gasUrl, token);
+        showView('mainView');
+      });
+
+      // ステップ5: エラー画面からの復帰
+      document.getElementById('retryButton').addEventListener('click', function () {
+        showView('mainView');
+      });
+
+      // ステップ6: サービスワーカー登録（PWAインストール要件）
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch(function (err) {
+          // 登録失敗してもアプリ自体は動くため、ログだけ残す
+          console.warn('サービスワーカーの登録に失敗:', err);
+        });
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

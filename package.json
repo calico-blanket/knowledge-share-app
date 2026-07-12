@@ -1,0 +1,11 @@
+{
+  "name": "knowledge-share-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "共有シートから記事URLをカテゴリ別にGoogle Driveへ保存する個人用PWA + GAS",
+  "scripts": {
+    "test": "node --test test/gas.test.js test/client.test.js",
+    "dev": "node scripts/dev_server.js",
+    "icons": "node scripts/generate_icons.js"
+  }
+}
