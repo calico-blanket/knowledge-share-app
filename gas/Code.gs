@@ -45,8 +45,8 @@ var TIME_ZONE = 'Asia/Tokyo';
 // 検索用インデックス（Googleスプレッドシート）関連の定数
 var INDEX_SHEET_ID_PROPERTY = 'INDEX_SHEET_ID'; // スクリプトプロパティに保存するID
 var INDEX_SHEET_NAME = 'ナレッジ一覧';
-var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ'];
-var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5 };
+var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル'];
+var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5, FILE: 6 };
 
 // 一覧APIで一度に返す最大件数（際限なく巨大なレスポンスになるのを防ぐ簡易上限）
 var LIST_MAX_ITEMS = 500;
@@ -191,17 +191,22 @@ function handleSave_(body) {
   //   タイトルと同じ内容が本文中に二重表示されるのを防ぐ）
   var memo = isDuplicateMemo_(params.memo, details.title) ? '' : params.memo;
 
-  // ステップ4: Drive のカテゴリフォルダへ Markdown ファイルとして保存
+  // ステップ4: Drive のカテゴリフォルダへ Googleドキュメントとして保存
+  // （プレーンテキスト/Markdownファイルは、クラウド版Claudeの Google Drive
+  //   連携（自然言語での自動読み込み）が直接サポートするMIMEタイプに含まれておらず、
+  //   確実に内容を読ませるには Google Docs 形式にする必要があるため）
   var saved = saveToDrive_(
     params.category, resolvedUrl, details.title, memo, details.bodyText, params.url
   );
 
   // ステップ5: 検索用インデックス（Sheets）に1行追記する
-  // インデックスへの追記に失敗しても、Markdown本体の保存は成功しているため
+  // インデックスへの追記に失敗しても、Doc本体の保存は成功しているため
   // ユーザーには成功として返す（インデックスは検索補助であり本体ではない）
   try {
     var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
-    appendIndexRow_(rootFolder, saved.savedAt, params.category, details.title, resolvedUrl, memo);
+    appendIndexRow_(
+      rootFolder, saved.savedAt, params.category, details.title, resolvedUrl, memo, saved.fileUrl
+    );
   } catch (indexErr) {
     console.error('インデックスへの追記に失敗しました: ' + indexErr);
   }
@@ -563,10 +568,19 @@ function isDuplicateMemo_(memo, title) {
 
 /**
  * 「ナレッジ/<カテゴリ名>/」フォルダ（無ければ自動作成）に
- * 1記事1ファイルの Markdown として保存する。
+ * 1記事1ファイルの Googleドキュメントとして保存する。
+ *
+ * プレーンテキスト/Markdownファイル（text/markdown）ではなく Google Docs
+ * ネイティブ形式にしているのは、クラウド版Claudeの Google Drive 連携（自然言語での
+ * 自動読み込み）がサポートするMIMEタイプに text/markdown・text/plain が含まれておらず、
+ * プレーンテキストのままだとAIがファイルを開けない（スクリーンショット等の代替手段が
+ * 必要になる）ことが実運用で判明したため。内容自体はこれまで通りMarkdown記法の文字列を
+ * そのままドキュメント本文に流し込む（見た目上は#等の記号が残るプレーンテキスト表示だが、
+ * AI・人間どちらにも構造は読み取れる）。
+ *
  * url は解決済みの実URL、originalUrl は共有時点の（短縮/リダイレクトの可能性がある）URL。
- * 両者が同じ場合、Markdown内に共有元URLの行は出さない。
- * 戻り値: { fileName: 実際に保存したファイル名, fileId: DriveのファイルID }
+ * 両者が同じ場合、本文内に共有元URLの行は出さない。
+ * 戻り値: { fileName, fileId, fileUrl, savedAt }
  */
 function saveToDrive_(category, url, title, memo, bodyText, originalUrl) {
   // ステップ1: ルートフォルダ「ナレッジ」を取得（無ければ作成）
@@ -587,12 +601,21 @@ function saveToDrive_(category, url, title, memo, bodyText, originalUrl) {
     fileName = buildFileName_(title, dateStr + '_' + timeStr);
   }
 
-  // ステップ4: Markdown 本文を組み立てて保存
+  // ステップ4: 本文を組み立てる
   var savedAt = Utilities.formatDate(now, TIME_ZONE, 'yyyy-MM-dd HH:mm');
   var content = buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalUrl);
-  var file = categoryFolder.createFile(fileName, content, 'text/markdown');
 
-  return { fileName: fileName, fileId: file.getId(), savedAt: savedAt };
+  // ステップ5: Googleドキュメントとして作成し、カテゴリフォルダへ移動する
+  // （DocumentApp.create は既定でマイドライブ直下に作るため、Sheetsインデックスの
+  //   作成と同じ要領で addFile/removeFile により目的のフォルダへ移す）
+  var doc = DocumentApp.create(fileName);
+  var file = DriveApp.getFileById(doc.getId());
+  categoryFolder.addFile(file);
+  DriveApp.getRootFolder().removeFile(file);
+  doc.getBody().setText(content);
+  doc.saveAndClose();
+
+  return { fileName: fileName, fileId: doc.getId(), fileUrl: doc.getUrl(), savedAt: savedAt };
 }
 
 /**
@@ -704,17 +727,25 @@ function getOrCreateIndexSheet_(rootFolder) {
 }
 
 /**
- * インデックスシートに1行追記する。タイトル列は元記事URLへのHYPERLINKにする。
+ * インデックスシートに1行追記する。
+ * タイトル列は元記事URLへのHYPERLINK、Driveファイル列は保存したGoogleドキュメントへの
+ * HYPERLINKにする（後者は、Drive全文検索のインデックス反映を待たずにAIがファイルへ
+ * 直接ジャンプできるようにするための導線）。
  */
-function appendIndexRow_(rootFolder, savedAt, category, title, url, memo) {
+function appendIndexRow_(rootFolder, savedAt, category, title, url, memo, fileUrl) {
   var sheet = getOrCreateIndexSheet_(rootFolder);
-  sheet.appendRow([savedAt, category, title, url, memo || '']);
-
+  sheet.appendRow([savedAt, category, title, url, memo || '', '']);
   var lastRow = sheet.getLastRow();
+
   var titleCell = sheet.getRange(lastRow, INDEX_COL.TITLE);
   titleCell.setFormula(
     '=HYPERLINK("' + escapeFormulaString_(url) + '","' + escapeFormulaString_(title) + '")'
   );
+
+  if (fileUrl) {
+    var fileCell = sheet.getRange(lastRow, INDEX_COL.FILE);
+    fileCell.setFormula('=HYPERLINK("' + escapeFormulaString_(fileUrl) + '","開く")');
+  }
 }
 
 /**

@@ -51,6 +51,13 @@ function createFolderStub(name) {
     },
     addFile(fileHandle) {
       folder.driveFiles.push(fileHandle);
+      // Googleドキュメント（DocumentApp.create相当）の場合は、既存の files 配列にも
+      // 登録する。同一オブジェクト参照なので、後から doc.getBody().setText() で
+      // 更新される content もテスト側からそのまま参照できる（実際のDrive APIでも
+      // getFilesByName はファイル種別を問わず名前一致で見つかる）。
+      if (fileHandle._isDoc) {
+        folder.files.push(fileHandle);
+      }
       return folder;
     },
     removeFile(fileHandle) {
@@ -91,6 +98,32 @@ function createSheetStub() {
   };
 }
 
+/**
+ * インメモリの Googleドキュメント「ハンドル」を作る。
+ * getBody().setText() で content プロパティを直接更新する（folder.files に登録された
+ * 同一オブジェクトからも参照できるようにするため、別オブジェクトへコピーしない）。
+ */
+function createDocStub(id, name) {
+  const handle = {
+    _isDoc: true,
+    name,
+    content: '',
+    mimeType: 'application/vnd.google-apps.document',
+    getId: () => id,
+    getUrl: () => 'https://docs.google.com/document/d/' + id + '/edit',
+    getBody() {
+      return {
+        setText(text) {
+          handle.content = text;
+          return this;
+        }
+      };
+    },
+    saveAndClose() {}
+  };
+  return handle;
+}
+
 /** GAS の FolderIterator/FileIterator 相当（hasNext/next だけ） */
 function makeIterator(items) {
   let index = 0;
@@ -121,6 +154,7 @@ function loadGasScript(options = {}) {
   const driveFilesById = {}; // ファイルID -> ハンドル（SpreadsheetApp.create が登録する）
   const spreadsheetsById = {}; // スプレッドシートID -> {getId, getSheets}
   let spreadsheetIdCounter = 0;
+  let docIdCounter = 0;
   const scriptProps = Object.assign({}, options.scriptProperties || {});
 
   const context = {
@@ -145,6 +179,15 @@ function loadGasScript(options = {}) {
       openById(id) {
         if (!spreadsheetsById[id]) { throw new Error('スタブ: スプレッドシートが見つかりません ' + id); }
         return spreadsheetsById[id];
+      }
+    },
+    // --- DocumentApp スタブ ---
+    DocumentApp: {
+      create(name) {
+        const id = 'doc-' + (++docIdCounter);
+        const handle = createDocStub(id, name);
+        driveFilesById[id] = handle;
+        return handle;
       }
     },
     // --- UrlFetchApp スタブ ---
@@ -455,7 +498,7 @@ test('インデックス: 保存すると同時にSheetsへ1行追記される�
   const rows = spreadsheetsById[ids[0]]._sheet._rows;
   assert.strictEqual(rows.length, 2, 'ヘッダ行 + データ1行');
   // vm(別レルム)の配列と比較するため、prototypeを問わない Array.from で正規化してから比較する
-  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ']);
+  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
   assert.strictEqual(rows[1][1], 'PC系');
   assert.strictEqual(rows[1][2], '索引テスト記事'); // HYPERLINKの表示値(タイトル)
   assert.strictEqual(rows[1][3], 'https://example.com/idx');
@@ -808,4 +851,44 @@ test('doPost: メモがタイトルと異なれば通常通り「メモ」節を
   callDoPost(context, { url: 'https://example.com/diff', category: 'PC系', memo: '別のコメント' });
   const file = rootFolder.subFolders[0].subFolders[0].files[0];
   assert.match(file.content, /## メモ\n\n別のコメント/);
+});
+
+// ---- Google Docs形式での保存 --------------------------------------
+// プレーンテキスト/Markdown（text/markdown）はクラウド版Claudeの Google Drive
+// 連携が直接読めるMIMEタイプに含まれないため、Google Docsネイティブ形式で保存する。
+
+test('doPost: 記事はGoogleドキュメント（DocumentApp）として作成される', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>Docs形式テスト</title><p>本文</p>' })
+  });
+  const result = callDoPost(context, { url: 'https://example.com/docs-test', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+
+  const file = rootFolder.subFolders[0].subFolders[0].files[0];
+  assert.strictEqual(file._isDoc, true, 'createFileではなくDocumentApp.createで作られている');
+  assert.strictEqual(file.mimeType, 'application/vnd.google-apps.document');
+  assert.match(file.getUrl(), /^https:\/\/docs\.google\.com\/document\/d\//);
+});
+
+test('doPost: Sheetsインデックスの「Driveファイル」列にドキュメントへのHYPERLINKが入る', () => {
+  const { context, spreadsheetsById } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>索引にファイルリンク</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/index-file-link', category: 'PC系' });
+
+  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
+  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
+  assert.strictEqual(rows[1][5], '開く', 'Driveファイル列はHYPERLINKの表示値「開く」になる');
+});
+
+test('doPost: 同名記事の重複判定はGoogleドキュメントに対しても機能する（上書き防止）', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>重複タイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/dup-a', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/dup-b', category: 'PC系' });
+
+  const files = rootFolder.subFolders[0].subFolders[0].files;
+  assert.strictEqual(files.length, 2, '2件ともドキュメントとして保存される');
+  assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名（ドキュメントのタイトル）が衝突しない');
 });
