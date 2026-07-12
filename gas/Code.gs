@@ -55,17 +55,21 @@ var LIST_MAX_ITEMS = 500;
 
 /**
  * GET エンドポイント。
- * - パラメータ無し: 動作確認用メッセージを返す
- * - ?action=list&category=xxx : そのカテゴリの保存済み記事一覧を返す
- * - ?action=categories : カテゴリ一覧とDriveの「ナレッジ」フォルダURLを返す
+ * - パラメータ無し: 動作確認用メッセージを返す（合言葉不要の稼働確認）
+ * - ?action=list&category=xxx&token=xxx : そのカテゴリの保存済み記事一覧を返す
+ * - ?action=categories&token=xxx : カテゴリ一覧とDriveの「ナレッジ」フォルダURLを返す
+ * データを返す action は、POSTと同様に SHARED_TOKEN（設定時）の照合を必須とする。
+ * 記事一覧はタイトル・URL・メモといった個人の閲覧記録に近い情報を含むため、
+ * WebアプリURLを知られただけでは読めないようにしておく。
  */
 function doGet(e) {
   var action = e && e.parameter && e.parameter.action;
+  var token = String((e && e.parameter && e.parameter.token) || '');
   if (action === 'list') {
-    return handleList_(e.parameter.category);
+    return handleList_(e.parameter.category, token);
   }
   if (action === 'categories') {
-    return handleCategories_();
+    return handleCategories_(token);
   }
   return jsonResponse_({
     ok: true,
@@ -77,8 +81,9 @@ function doGet(e) {
  * カテゴリ一覧と、Driveの「ナレッジ」フォルダを直接開くためのURLを返す。
  * PWAの起動時・設定画面・一覧画面でカテゴリボタンを動的に描画するために使う。
  */
-function handleCategories_() {
+function handleCategories_(token) {
   try {
+    checkToken_(token);
     var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
     return jsonResponse_({
       ok: true,
@@ -93,8 +98,9 @@ function handleCategories_() {
 /**
  * 指定カテゴリの保存済み記事一覧を、検索用インデックス（Sheets）から新しい順に返す。
  */
-function handleList_(category) {
+function handleList_(category, token) {
   try {
+    checkToken_(token);
     if (!category || getCategories_().indexOf(category) === -1) {
       throw new Error('不明なカテゴリです: ' + category);
     }
@@ -342,22 +348,6 @@ function saveCategories_(categories) {
   PropertiesService.getScriptProperties().setProperty(CATEGORIES_PROPERTY, JSON.stringify(categories));
 }
 
-/**
- * スクリプトプロパティ SHARED_TOKEN が設定されている場合、
- * リクエストの token と一致するか確認する。未設定なら素通し。
- */
-function checkToken_(token) {
-  var expected = '';
-  try {
-    expected = PropertiesService.getScriptProperties().getProperty('SHARED_TOKEN') || '';
-  } catch (e) {
-    expected = '';
-  }
-  if (expected && token !== expected) {
-    throw new Error('合言葉が一致しません。PWAの設定画面を確認してください');
-  }
-}
-
 // ---- URL解決 --------------------------------------------------
 
 // 一般的なブラウザに近い UA を名乗る（ボット扱いで拒否されるサイト対策）
@@ -521,10 +511,16 @@ function decodeEntities_(text) {
 
 /**
  * HTML から本文らしきテキストを抽出する純粋関数。
- * script/style/コメントを除去し、ブロック要素の境目で改行を入れてから
- * 残りのタグを剥がす素朴な実装（ナビ・広告等を判別して除去する高度な
- * 抽出（Readability相当）ではない点に注意。X/Twitter等JS描画に依存する
- * サイトでは本文がほぼ取れないことがある）。
+ *
+ * 抽出手順:
+ *   1. script/style/コメントと、本文でないことが明らかな構造要素
+ *      （nav/header/footer/aside = メニュー・ランキング・フッター等）を除去
+ *   2. <article> または <main> があればその中身だけを対象にする
+ *      （実運用で、サイト共通部品が本文より先に来て4000文字上限を圧迫する
+ *        事例があったため。セマンティックタグの無いサイトはページ全体で代替）
+ *   3. ブロック要素の境目で改行を入れてから残りのタグを剥がす
+ * Readability相当の高度な本文判定ではない点、X/Twitter等JS描画に依存する
+ * サイトでは本文がほぼ取れない点は従来と同じ。
  * 長すぎる場合は BODY_TEXT_MAX で打ち切る。
  */
 function extractBodyText_(html) {
@@ -532,13 +528,22 @@ function extractBodyText_(html) {
     return '';
   }
 
-  var text = html
+  // ステップ1: 非本文要素の除去
+  var work = html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    // ブロック要素の開始位置に改行を入れる（タグを剥がした後も段落感を残すため）
+    .replace(/<(nav|header|footer|aside)\b[\s\S]*?<\/\1>/gi, ' ');
+
+  // ステップ2: article/main があればそこだけを本文候補にする
+  var m = work.match(/<article[^>]*>([\s\S]*?)<\/article>/i) ||
+          work.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  var target = m ? m[1] : work;
+
+  // ステップ3: ブロック要素の開始位置に改行を入れ（段落感を残すため）、残りのタグを除去
+  var text = target
     .replace(/<(br|p|div|li|h[1-6]|tr)[^>]*>/gi, '\n')
-    .replace(/<[^>]+>/g, ' '); // 残りのタグをすべて除去
+    .replace(/<[^>]+>/g, ' ');
 
   text = decodeEntities_(text);
   text = text
@@ -630,7 +635,9 @@ function getOrCreateFolder_(parentFolder, name) {
 }
 
 /**
- * 「タイトル_YYYY-MM-DD.md」形式のファイル名を組み立てる純粋関数。
+ * 「タイトル_YYYY-MM-DD」形式のドキュメント名を組み立てる純粋関数。
+ * Googleドキュメントとして保存するため拡張子は付けない
+ * （Markdownファイル時代の .md はドキュメント名としては紛らわしいだけなので廃止）。
  * Drive/OS で問題になりうる記号を除去し、長すぎるタイトルは切り詰める。
  */
 function buildFileName_(title, datePart) {
@@ -641,7 +648,7 @@ function buildFileName_(title, datePart) {
   if (safe.length > FILENAME_TITLE_MAX) {
     safe = safe.substring(0, FILENAME_TITLE_MAX) + '…';
   }
-  return safe + '_' + datePart + '.md';
+  return safe + '_' + datePart;
 }
 
 /**
@@ -734,7 +741,17 @@ function getOrCreateIndexSheet_(rootFolder) {
  */
 function appendIndexRow_(rootFolder, savedAt, category, title, url, memo, fileUrl) {
   var sheet = getOrCreateIndexSheet_(rootFolder);
-  sheet.appendRow([savedAt, category, title, url, memo || '', '']);
+  // 自由入力由来の値（タイトル・メモ・カテゴリ）はセル値としてサニタイズする。
+  // GASの appendRow/setValue は先頭が = の文字列を数式として解釈するため、
+  // ページタイトルや共有メモに =IMPORTXML(...) 等が入っていると実行されてしまう。
+  sheet.appendRow([
+    savedAt,
+    sanitizeCellText_(category),
+    sanitizeCellText_(title),
+    url,
+    sanitizeCellText_(memo || ''),
+    ''
+  ]);
   var lastRow = sheet.getLastRow();
 
   var titleCell = sheet.getRange(lastRow, INDEX_COL.TITLE);
@@ -754,6 +771,19 @@ function appendIndexRow_(rootFolder, savedAt, category, title, url, memo, fileUr
  */
 function escapeFormulaString_(text) {
   return String(text).replace(/"/g, '""');
+}
+
+/**
+ * セル値として書き込む自由入力テキストを無害化する純粋関数。
+ * 先頭が = や + の文字列は数式として解釈されるため、先頭にアポストロフィを付ける
+ * （Sheetsのユーザー入力と同じエスケープ。表示・読み取り時にアポストロフィは現れない）。
+ */
+function sanitizeCellText_(text) {
+  var value = String(text);
+  if (/^[=+]/.test(value)) {
+    return "'" + value;
+  }
+  return value;
 }
 
 // ---- レスポンス ---------------------------------------------
