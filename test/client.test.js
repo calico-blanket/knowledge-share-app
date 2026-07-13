@@ -28,10 +28,13 @@ function loadSharedLogic() {
   vm.createContext(context);
   vm.runInContext(match[1], context);
   assert.strictEqual(typeof context.parseSharedParams, 'function');
-  return context.parseSharedParams;
+  assert.strictEqual(typeof context.moveArrayItem, 'function');
+  return context;
 }
 
-const parseSharedParams = loadSharedLogic();
+const sharedLogic = loadSharedLogic();
+const parseSharedParams = sharedLogic.parseSharedParams;
+const moveArrayItem = sharedLogic.moveArrayItem;
 
 test('shared_url にURLが入っている場合（標準形）', () => {
   const result = parseSharedParams('?shared_url=' + encodeURIComponent('https://example.com/article'));
@@ -108,8 +111,12 @@ test('保存後の画面遷移: 自動でwindow.close()せず、トップ画面(
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   // 旧仕様（保存成功後に自動でウィンドウを閉じる）が復活していないことの回帰確認
   assert.doesNotMatch(html, /setTimeout\(function \(\) \{ window\.close\(\); \}/);
-  // 保存成功後、doneViewを一定時間表示してからmainViewへ戻る処理があること
-  assert.match(html, /setTimeout\(function \(\) \{ showView\('mainView'\); \}, 1200\)/);
+  // 保存表示後、一定時間でmainViewへ戻る処理があること
+  // （送信失敗のエラー表示に切り替わっていた場合は上書きしないガード付き）
+  const m = html.match(/setTimeout\(function \(\) \{([\s\S]*?)\}, 1200\)/);
+  assert.ok(m, '1200ms後の画面遷移処理が存在すること');
+  assert.match(m[1], /showView\('mainView'\)/);
+  assert.match(m[1], /doneView/, 'doneView表示中のみ戻るガードがあること');
 });
 
 test('終了ボタン: クリックでwindow.close()を呼ぶ', () => {
@@ -125,7 +132,7 @@ test('XSS対策: 一覧描画がHTML文字列結合ではなくDOM APIで組み�
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   assert.doesNotMatch(html, /href="' \+ escapeHtml/, '旧実装(文字列結合href)が復活していないこと');
 
-  const m = html.match(/function renderListItems\(items\) \{([\s\S]*?)\n    \}/);
+  const m = html.match(/function renderListItems\(items, hasMore\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'renderListItems関数が存在すること');
   assert.match(m[1], /createElement\('a'\)/, 'DOM APIでリンクを生成していること');
   assert.match(m[1], /textContent/, 'テキストはtextContentで設定していること');
@@ -137,4 +144,102 @@ test('GET保護: gasGetがtokenパラメータを付与している', () => {
   const m = html.match(/async function gasGet\(action, extraParams\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'gasGet関数が存在すること');
   assert.match(m[1], /searchParams\.set\('token'/, 'GETリクエストにもtokenを含めること');
+});
+
+// ---- 改善1: 保存の fire-and-forget（keepalive + sendBeacon） --------
+
+test('保存の高速化: fetchにkeepalive:trueが付いている（送信後にPWAを閉じても送信が完了する）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function submitToGas\(url, category, memo\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'submitToGas関数が存在すること');
+  assert.match(m[1], /keepalive: true/, 'fetchにkeepalive:trueを指定していること');
+  assert.doesNotMatch(m[1], /await gasPost/, '応答を待つ旧実装(await gasPost)が復活していないこと');
+});
+
+test('保存の高速化: keepalive非対応環境向けに navigator.sendBeacon フォールバックがある', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function submitToGas\(url, category, memo\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'submitToGas関数が存在すること');
+  assert.match(m[1], /navigator\.sendBeacon/, 'sendBeaconフォールバックがあること');
+  assert.match(m[1], /text\/plain;charset=utf-8/, 'CORSプリフライトを避けるtext/plainで送ること');
+});
+
+test('保存の高速化: 送信失敗時の案内メッセージが仕様どおり表示される', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /保存できませんでした。通信環境を確認してください/);
+  // オフラインの事前検知（navigator.onLine）も行うこと
+  assert.match(html, /navigator\.onLine === false/);
+});
+
+test('保存の高速化: 応答待ち専用の送信中ビュー(sendingView)が廃止されている', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.doesNotMatch(html, /sendingView/);
+});
+
+// ---- 改善2・3: カテゴリ・記事一覧の localStorage キャッシュ ----------
+
+test('キャッシュ: カテゴリ・記事一覧のキャッシュキーが定義され、SWR共通関数が使われている', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /var CATEGORIES_CACHE_KEY = /);
+  assert.match(html, /var LIST_CACHE_KEY = /);
+  // メイン画面・一覧カテゴリ画面・設定画面のカテゴリ描画がSWR共通関数経由であること
+  const calls = html.match(/renderCategoriesWithRevalidate\(/g) || [];
+  assert.ok(calls.length >= 4, 'SWR共通関数が定義され、3画面以上から呼ばれていること（実際: ' + calls.length + '箇所）');
+});
+
+test('キャッシュ: fetchCategories成功時にカテゴリキャッシュが保存される', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function fetchCategories\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'fetchCategories関数が存在すること');
+  assert.match(m[1], /saveCategoriesCache\(\)/);
+});
+
+test('キャッシュ: 記事一覧はキャッシュ即描画→裏で取得の順で処理される', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function openListItemsView\(category\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'openListItemsView関数が存在すること');
+  const body = m[1];
+  const cacheRenderPos = body.indexOf('renderListItems(cached.items');
+  const fetchPos = body.indexOf("gasGet('list'");
+  assert.ok(cacheRenderPos !== -1, 'キャッシュからの即描画があること');
+  assert.ok(fetchPos !== -1, 'GASからの取得があること');
+  assert.ok(cacheRenderPos < fetchPos, 'キャッシュ描画が取得より先であること');
+});
+
+test('ページング: 続きがある場合の「さらに読み込む」ボタンとoffset付き取得がある', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /さらに読み込む/);
+  assert.match(html, /offset: state\.listItems\.length/);
+});
+
+// ---- 改善4: カテゴリの並び替え（moveArrayItem 純粋関数 + ↑↓ボタン） --
+
+test('moveArrayItem: 要素を1つ上へ移動できる（元の配列は破壊しない）', () => {
+  const original = ['A', 'B', 'C'];
+  const result = moveArrayItem(original, 1, -1);
+  assert.deepStrictEqual(result, ['B', 'A', 'C']);
+  assert.deepStrictEqual(original, ['A', 'B', 'C'], '元の配列が変更されないこと');
+});
+
+test('moveArrayItem: 要素を1つ下へ移動できる', () => {
+  assert.deepStrictEqual(moveArrayItem(['A', 'B', 'C'], 1, 1), ['A', 'C', 'B']);
+});
+
+test('moveArrayItem: 先頭をさらに上へ・末尾をさらに下へは何も起きない', () => {
+  assert.deepStrictEqual(moveArrayItem(['A', 'B'], 0, -1), ['A', 'B']);
+  assert.deepStrictEqual(moveArrayItem(['A', 'B'], 1, 1), ['A', 'B']);
+});
+
+test('moveArrayItem: 範囲外indexでも例外を投げず元と同じ内容を返す', () => {
+  assert.deepStrictEqual(moveArrayItem(['A'], 5, -1), ['A']);
+  assert.deepStrictEqual(moveArrayItem([], 0, 1), []);
+});
+
+test('並び替えUI: ↑↓ボタンがあり、reorderCategoriesアクションをGASへ送る', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function renderCategoryManageList\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderCategoryManageList関数が存在すること');
+  assert.match(m[1], /'↑'/);
+  assert.match(m[1], /'↓'/);
+  assert.match(html, /action: 'reorderCategories'/, '並び順の保存はGAS側に永続化すること');
 });
