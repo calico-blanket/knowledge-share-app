@@ -22,12 +22,17 @@ const vm = require('node:vm');
  * インメモリの Drive フォルダを作る。
  * GAS の Folder オブジェクトのうち Code.gs が使うメソッドだけ実装する。
  */
+let folderIdCounter = 0;
+
 function createFolderStub(name) {
   const folder = {
     name,
+    id: 'folder-' + (++folderIdCounter),
     subFolders: [],
     files: [],
     driveFiles: [], // addFile/removeFile で管理する汎用ファイル参照（Sheets移動用）
+    getId() { return folder.id; },
+    isTrashed() { return false; },
     getFoldersByName(target) {
       const hits = folder.subFolders.filter((f) => f.name === target);
       return makeIterator(hits);
@@ -124,6 +129,16 @@ function createDocStub(id, name) {
   return handle;
 }
 
+/** フォルダツリーをIDで探す（DriveApp.getFolderById スタブ用） */
+function findFolderById(folder, id) {
+  if (folder.id === id) { return folder; }
+  for (const child of folder.subFolders) {
+    const hit = findFolderById(child, id);
+    if (hit) { return hit; }
+  }
+  return null;
+}
+
 /** GAS の FolderIterator/FileIterator 相当（hasNext/next だけ） */
 function makeIterator(items) {
   let index = 0;
@@ -161,6 +176,12 @@ function loadGasScript(options = {}) {
     // --- DriveApp スタブ ---
     DriveApp: {
       getRootFolder: () => rootFolder,
+      getFolderById(id) {
+        // ルートフォルダ自身はIDで開けない想定にする（Code.gsは「ナレッジ」フォルダのIDしか渡さない）
+        const hit = findFolderById(rootFolder, id);
+        if (!hit || hit === rootFolder) { throw new Error('スタブ: フォルダが見つかりません ' + id); }
+        return hit;
+      },
       getFileById(id) {
         if (!driveFilesById[id]) { throw new Error('スタブ: ファイルが見つかりません ' + id); }
         return driveFilesById[id];
@@ -248,9 +269,9 @@ function callDoPost(context, bodyObj) {
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=list&category=...&token=... 相当のパラメータで呼び、レスポンスJSONを返す */
-function callDoGetList(context, category, token) {
-  const e = { parameter: { action: 'list', category: category, token: token } };
+/** doGet を ?action=list&category=...&token=...&offset=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetList(context, category, token, offset) {
+  const e = { parameter: { action: 'list', category: category, token: token, offset: offset } };
   const output = context.doGet(e);
   return JSON.parse(output.getContent());
 }
@@ -999,4 +1020,172 @@ test('Code.gs: checkToken_ の定義がちょうど1つである（重複定義�
   const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
   const definitions = source.match(/function checkToken_\(/g) || [];
   assert.strictEqual(definitions.length, 1);
+});
+
+// ---- カテゴリの並び替え(action=reorderCategories) --------------------
+
+test('reorderCategories: 並び替えた順序が保存され、以後の categories API に反映される', () => {
+  const { context } = loadGasScript();
+  const original = callDoGetCategories(context).categories;
+  const reordered = original.slice().reverse();
+
+  const result = callDoPost(context, { action: 'reorderCategories', categories: reordered });
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.categories, reordered);
+
+  // 再取得しても新しい順序が保持されている（スクリプトプロパティに永続化）
+  assert.deepStrictEqual(callDoGetCategories(context).categories, reordered);
+});
+
+test('reorderCategories: 件数が一致しない（勝手な削除・追加の混入）は拒否される', () => {
+  const { context } = loadGasScript();
+  const original = callDoGetCategories(context).categories;
+
+  const missingOne = original.slice(1); // 1件欠け
+  const r1 = callDoPost(context, { action: 'reorderCategories', categories: missingOne });
+  assert.strictEqual(r1.ok, false);
+  assert.match(r1.error, /一致しません/);
+
+  const extraOne = original.concat(['勝手に追加']); // 1件過剰
+  const r2 = callDoPost(context, { action: 'reorderCategories', categories: extraOne });
+  assert.strictEqual(r2.ok, false);
+
+  // どちらの失敗でも元の並びが壊れていないこと
+  assert.deepStrictEqual(callDoGetCategories(context).categories, original);
+});
+
+test('reorderCategories: 同数でも要素の中身が違う（改名の混入）は拒否される', () => {
+  const { context } = loadGasScript();
+  const original = callDoGetCategories(context).categories;
+  const renamed = original.slice();
+  renamed[0] = '存在しない名前へ改名';
+
+  const result = callDoPost(context, { action: 'reorderCategories', categories: renamed });
+  assert.strictEqual(result.ok, false);
+  assert.deepStrictEqual(callDoGetCategories(context).categories, original);
+});
+
+test('reorderCategories: categories が配列でない・無い場合はエラー', () => {
+  const { context } = loadGasScript();
+  const r1 = callDoPost(context, { action: 'reorderCategories' });
+  assert.strictEqual(r1.ok, false);
+  const r2 = callDoPost(context, { action: 'reorderCategories', categories: 'PC系' });
+  assert.strictEqual(r2.ok, false);
+});
+
+test('reorderCategories: SHARED_TOKEN検証の対象になる（合言葉なしは拒否）', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const result = callDoPost(context, {
+    action: 'reorderCategories',
+    categories: ['a'] // tokenチェックが先に走るため中身は届かない
+  });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('reorderCategories: 並び替え後に追加したカテゴリは従来どおり末尾に付く', () => {
+  const { context } = loadGasScript();
+  const original = callDoGetCategories(context).categories;
+  const reordered = original.slice().reverse();
+  callDoPost(context, { action: 'reorderCategories', categories: reordered });
+
+  const result = callDoPost(context, { action: 'addCategory', name: '新しいカテゴリ' });
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.categories, reordered.concat(['新しいカテゴリ']));
+});
+
+// ---- 一覧APIのページング(50件区切り + offset) ------------------------
+
+test('一覧API: 50件を超える保存がある場合、先頭ページは新しい順50件 + hasMore:true になる', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => makeFetchResponse({ body: '<title>記事' + url.split('/').pop() + '</title>' })
+  });
+  // 55件保存する（記事0が最古、記事54が最新）
+  for (let i = 0; i < 55; i++) {
+    const r = callDoPost(context, { url: 'https://example.com/' + i, category: 'PC系' });
+    assert.strictEqual(r.ok, true, i + '件目の保存が成功すること');
+  }
+
+  const page1 = callDoGetList(context, 'PC系');
+  assert.strictEqual(page1.ok, true);
+  assert.strictEqual(page1.items.length, 50, '先頭ページは50件で区切られる');
+  assert.strictEqual(page1.hasMore, true, '続きがあることを示すフラグが立つ');
+  assert.strictEqual(page1.items[0].title, '記事54', '最新の保存が先頭に来る');
+  assert.strictEqual(page1.items[49].title, '記事5', '50件目は新しい順で50番目');
+});
+
+test('一覧API: offset指定で続きのページが取得でき、最後のページは hasMore:false になる', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => makeFetchResponse({ body: '<title>記事' + url.split('/').pop() + '</title>' })
+  });
+  for (let i = 0; i < 55; i++) {
+    callDoPost(context, { url: 'https://example.com/' + i, category: 'PC系' });
+  }
+
+  const page2 = callDoGetList(context, 'PC系', undefined, '50');
+  assert.strictEqual(page2.ok, true);
+  assert.strictEqual(page2.items.length, 5, '2ページ目は残りの5件');
+  assert.strictEqual(page2.hasMore, false, '最後のページではフラグが下りる');
+  assert.strictEqual(page2.items[0].title, '記事4');
+  assert.strictEqual(page2.items[4].title, '記事0', '最古の保存が末尾に来る');
+});
+
+test('一覧API: offsetが不正な値（負数・文字列）の場合は先頭ページとして扱う', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>1件だけ</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/only', category: 'PC系' });
+
+  for (const bad of ['-5', 'abc', '']) {
+    const result = callDoGetList(context, 'PC系', undefined, bad);
+    assert.strictEqual(result.ok, true, 'offset=' + JSON.stringify(bad) + ' でもエラーにしない');
+    assert.strictEqual(result.items.length, 1);
+    assert.strictEqual(result.hasMore, false);
+  }
+});
+
+// ---- ルートフォルダIDのキャッシュ（カテゴリ・一覧APIの高速化） --------
+
+test('ルートフォルダ: 一度アクセスするとIDがスクリプトプロパティに記憶される', () => {
+  const { context } = loadGasScript();
+  callDoGetCategories(context);
+  const props = context.PropertiesService.getScriptProperties();
+  assert.ok(props.getProperty('ROOT_FOLDER_ID'), 'ROOT_FOLDER_IDが保存されること');
+});
+
+test('ルートフォルダ: 記憶されたIDのフォルダが消えていても名前検索にフォールバックして復旧する', () => {
+  const { context, rootFolder } = loadGasScript({
+    scriptProperties: { ROOT_FOLDER_ID: 'folder-존재しないID' }
+  });
+  const result = callDoGetCategories(context);
+  assert.strictEqual(result.ok, true, '古いIDが無効でもエラーにならない');
+  assert.strictEqual(rootFolder.subFolders.length, 1, 'ナレッジフォルダが作られる');
+  const props = context.PropertiesService.getScriptProperties();
+  assert.strictEqual(
+    props.getProperty('ROOT_FOLDER_ID'), rootFolder.subFolders[0].getId(),
+    '正しいIDに更新されること'
+  );
+});
+
+test('ルートフォルダ: IDキャッシュ利用時もフォルダが二重に作られない', () => {
+  const { context, rootFolder } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>a</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/1', category: 'PC系' });
+  callDoGetCategories(context);
+  callDoGetList(context, 'PC系');
+  callDoPost(context, { url: 'https://example.com/2', category: 'PC系' });
+
+  const knowledgeFolders = rootFolder.subFolders.filter((f) => f.name === 'ナレッジ');
+  assert.strictEqual(knowledgeFolders.length, 1, '「ナレッジ」フォルダは1つだけ');
+});
+
+// ---- 新規追加関数の重複定義チェック（教訓の再発防止パターン） ----------
+
+test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（重複定義の再発防止）', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
+  for (const fn of ['handleReorderCategories_', 'getOrCreateRootFolder_', 'handleList_', 'getOrCreateIndexSheet_', 'appendIndexRow_', 'doGet', 'doPost']) {
+    const definitions = source.match(new RegExp('function ' + fn + '\\(', 'g')) || [];
+    assert.strictEqual(definitions.length, 1, fn + ' の定義がちょうど1つであること');
+  }
 });

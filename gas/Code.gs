@@ -21,6 +21,11 @@ var ROOT_FOLDER_NAME = 'ナレッジ';
 // （PWAから追加・削除できるようにするため、固定配列ではなくプロパティで管理する）
 var CATEGORIES_PROPERTY = 'CATEGORIES_JSON';
 
+// ルートフォルダ「ナレッジ」のIDを保存するスクリプトプロパティのキー
+// （毎回マイドライブ全体から名前検索すると数百ms〜数秒かかるため、
+//   一度見つけたフォルダのIDを覚えておき、以後はIDで直接開いて高速化する）
+var ROOT_FOLDER_ID_PROPERTY = 'ROOT_FOLDER_ID';
+
 // 初回アクセス時にスクリプトプロパティへ書き込む初期カテゴリ一覧
 // （LINE WORKS掲示板の構成を踏襲。Driveフォルダ名もカテゴリ名と同一にする）
 var DEFAULT_CATEGORIES = [
@@ -48,8 +53,10 @@ var INDEX_SHEET_NAME = 'ナレッジ一覧';
 var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル'];
 var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5, FILE: 6 };
 
-// 一覧APIで一度に返す最大件数（際限なく巨大なレスポンスになるのを防ぐ簡易上限）
-var LIST_MAX_ITEMS = 500;
+// 一覧APIで一度に返す件数（1ページ分）。
+// 件数が増えてもレスポンスが重くならないよう50件で区切り、
+// 続きは offset パラメータで取得する（PWA側の「さらに読み込む」ボタン用）
+var LIST_PAGE_SIZE = 50;
 
 // ---- エントリポイント ---------------------------------------
 
@@ -66,7 +73,7 @@ function doGet(e) {
   var action = e && e.parameter && e.parameter.action;
   var token = String((e && e.parameter && e.parameter.token) || '');
   if (action === 'list') {
-    return handleList_(e.parameter.category, token);
+    return handleList_(e.parameter.category, token, e.parameter.offset);
   }
   if (action === 'categories') {
     return handleCategories_(token);
@@ -84,11 +91,10 @@ function doGet(e) {
 function handleCategories_(token) {
   try {
     checkToken_(token);
-    var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
     return jsonResponse_({
       ok: true,
       categories: getCategories_(),
-      rootFolderUrl: rootFolder.getUrl()
+      rootFolderUrl: getOrCreateRootFolder_().getUrl()
     });
   } catch (err) {
     return jsonResponse_({ ok: false, error: String((err && err.message) || err) });
@@ -97,33 +103,53 @@ function handleCategories_(token) {
 
 /**
  * 指定カテゴリの保存済み記事一覧を、検索用インデックス（Sheets）から新しい順に返す。
+ * 一度に返すのは LIST_PAGE_SIZE 件まで。offset（新しい順で何件目から）を指定すると
+ * 続きのページを返し、まだ続きがある場合はレスポンスに hasMore: true を含める。
  */
-function handleList_(category, token) {
+function handleList_(category, token, offsetParam) {
   try {
     checkToken_(token);
     if (!category || getCategories_().indexOf(category) === -1) {
       throw new Error('不明なカテゴリです: ' + category);
     }
 
-    var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
-    var sheet = getOrCreateIndexSheet_(rootFolder);
+    // offset の検証（未指定・不正値は 0 = 先頭ページとして扱う）
+    var offset = parseInt(offsetParam, 10);
+    if (isNaN(offset) || offset < 0) {
+      offset = 0;
+    }
+
+    var sheet = getOrCreateIndexSheet_();
     var values = sheet.getDataRange().getValues(); // values[0] はヘッダ行
 
     var items = [];
-    // 新しい順（末尾の行から）に走査し、上限件数に達したら打ち切る
-    for (var i = values.length - 1; i >= 1 && items.length < LIST_MAX_ITEMS; i--) {
+    var matched = 0;   // このカテゴリで何件目まで見たか（offsetの読み飛ばし用）
+    var hasMore = false;
+    // 新しい順（末尾の行から）に走査し、offset分を読み飛ばして1ページ分集める
+    for (var i = values.length - 1; i >= 1; i--) {
       var row = values[i];
-      if (row[INDEX_COL.CATEGORY - 1] === category) {
-        items.push({
-          savedAt: row[INDEX_COL.SAVED_AT - 1],
-          title: row[INDEX_COL.TITLE - 1],
-          url: row[INDEX_COL.URL - 1],
-          memo: row[INDEX_COL.MEMO - 1] || ''
-        });
+      if (row[INDEX_COL.CATEGORY - 1] !== category) {
+        continue;
       }
+      matched++;
+      if (matched <= offset) {
+        continue; // 前のページで返却済み
+      }
+      if (items.length >= LIST_PAGE_SIZE) {
+        hasMore = true; // 1ページ分を超える該当行がまだある
+        break;
+      }
+      items.push({
+        savedAt: row[INDEX_COL.SAVED_AT - 1],
+        title: row[INDEX_COL.TITLE - 1],
+        url: row[INDEX_COL.URL - 1],
+        memo: row[INDEX_COL.MEMO - 1] || ''
+      });
     }
 
-    return jsonResponse_({ ok: true, category: category, items: items });
+    return jsonResponse_({
+      ok: true, category: category, items: items, offset: offset, hasMore: hasMore
+    });
   } catch (err) {
     return jsonResponse_({ ok: false, error: String((err && err.message) || err) });
   }
@@ -132,9 +158,10 @@ function handleList_(category, token) {
 /**
  * PWA からのPOSTリクエストを受け取るエントリポイント。
  * body.action で処理を振り分ける（省略時は 'save' = 記事の保存）。
- *   - save          : { url, category, memo? } を保存
- *   - addCategory   : { name } をカテゴリ一覧に追加
- *   - removeCategory: { name } をカテゴリ一覧から削除（保存済みデータは残す）
+ *   - save             : { url, category, memo? } を保存
+ *   - addCategory      : { name } をカテゴリ一覧に追加
+ *   - removeCategory   : { name } をカテゴリ一覧から削除（保存済みデータは残す）
+ *   - reorderCategories: { categories } の順にカテゴリの並び順を変更
  * すべての action 共通で token（合言葉）を検証する。
  */
 function doPost(e) {
@@ -150,6 +177,8 @@ function doPost(e) {
         return jsonResponse_(handleAddCategory_(body));
       case 'removeCategory':
         return jsonResponse_(handleRemoveCategory_(body));
+      case 'reorderCategories':
+        return jsonResponse_(handleReorderCategories_(body));
       default:
         throw new Error('不明なactionです: ' + action);
     }
@@ -209,9 +238,8 @@ function handleSave_(body) {
   // インデックスへの追記に失敗しても、Doc本体の保存は成功しているため
   // ユーザーには成功として返す（インデックスは検索補助であり本体ではない）
   try {
-    var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
     appendIndexRow_(
-      rootFolder, saved.savedAt, params.category, details.title, resolvedUrl, memo, saved.fileUrl
+      saved.savedAt, params.category, details.title, resolvedUrl, memo, saved.fileUrl
     );
   } catch (indexErr) {
     console.error('インデックスへの追記に失敗しました: ' + indexErr);
@@ -288,6 +316,33 @@ function handleRemoveCategory_(body) {
   categories.splice(index, 1);
   saveCategories_(categories);
   return { ok: true, categories: categories };
+}
+
+/**
+ * カテゴリの並び順を変更する(action=reorderCategories)。
+ * body.categories（新しい並び順の配列）が「現在のカテゴリ一覧の並び替え」に
+ * なっていることを検証してから保存する（追加・削除・改名の混入を防ぐ）。
+ * 並び順はカテゴリ一覧そのもの（配列の順序）として永続化されるため、
+ * 保存画面・一覧画面・設定画面のすべてに同じ順序が反映される。
+ */
+function handleReorderCategories_(body) {
+  var requested = body.categories;
+  if (Object.prototype.toString.call(requested) !== '[object Array]') {
+    throw new Error('並び替え後のカテゴリ一覧が指定されていません');
+  }
+
+  var normalized = requested.map(function (name) { return String(name); });
+  var current = getCategories_();
+
+  // 要素の集合が完全一致するか（順序だけの違いか）をソート済みJSONで比較する
+  var sortedRequested = JSON.stringify(normalized.slice().sort());
+  var sortedCurrent = JSON.stringify(current.slice().sort());
+  if (normalized.length !== current.length || sortedRequested !== sortedCurrent) {
+    throw new Error('並び替えの内容が現在のカテゴリ一覧と一致しません。画面を開き直してからやり直してください');
+  }
+
+  saveCategories_(normalized);
+  return { ok: true, categories: normalized };
 }
 
 /**
@@ -589,7 +644,7 @@ function isDuplicateMemo_(memo, title) {
  */
 function saveToDrive_(category, url, title, memo, bodyText, originalUrl) {
   // ステップ1: ルートフォルダ「ナレッジ」を取得（無ければ作成）
-  var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
+  var rootFolder = getOrCreateRootFolder_();
 
   // ステップ2: カテゴリフォルダを取得（無ければ作成）
   var categoryFolder = getOrCreateFolder_(rootFolder, category);
@@ -632,6 +687,33 @@ function getOrCreateFolder_(parentFolder, name) {
     return folders.next();
   }
   return parentFolder.createFolder(name);
+}
+
+/**
+ * ルートフォルダ「ナレッジ」を取得する（無ければ作成）。
+ * 名前検索（getFoldersByName）はマイドライブが大きいと遅いため、
+ * 一度見つけたフォルダのIDをスクリプトプロパティに記憶し、
+ * 2回目以降はIDで直接開く（カテゴリ一覧・記事一覧APIの応答高速化）。
+ * IDのフォルダが削除・ゴミ箱行きになっていた場合は名前検索からやり直す。
+ */
+function getOrCreateRootFolder_() {
+  var props = PropertiesService.getScriptProperties();
+  var cachedId = props.getProperty(ROOT_FOLDER_ID_PROPERTY);
+
+  if (cachedId) {
+    try {
+      var cached = DriveApp.getFolderById(cachedId);
+      if (!cached.isTrashed()) {
+        return cached;
+      }
+    } catch (openErr) {
+      // IDのフォルダが開けない（削除された等）→ 下の名前検索にフォールバック
+    }
+  }
+
+  var folder = getOrCreateFolder_(DriveApp.getRootFolder(), ROOT_FOLDER_NAME);
+  props.setProperty(ROOT_FOLDER_ID_PROPERTY, folder.getId());
+  return folder;
 }
 
 /**
@@ -705,8 +787,10 @@ function buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalU
  * 検索用インデックス・スプレッドシートの1枚目のシートを取得する。
  * スクリプトプロパティに保存済みのIDがあればそれを開き、
  * 無い（または削除されて開けない）場合は新規作成して「ナレッジ」フォルダに格納する。
+ * ルートフォルダの取得は新規作成時にしか必要ないため、その場合だけ行う
+ * （一覧APIの通常経路からDriveのフォルダ検索を無くして高速化するため）。
  */
-function getOrCreateIndexSheet_(rootFolder) {
+function getOrCreateIndexSheet_() {
   var props = PropertiesService.getScriptProperties();
   var sheetId = props.getProperty(INDEX_SHEET_ID_PROPERTY);
 
@@ -722,7 +806,7 @@ function getOrCreateIndexSheet_(rootFolder) {
 
   // 既定ではマイドライブ直下に作られるため、「ナレッジ」フォルダの中へ移動する
   var file = DriveApp.getFileById(spreadsheet.getId());
-  rootFolder.addFile(file);
+  getOrCreateRootFolder_().addFile(file);
   DriveApp.getRootFolder().removeFile(file);
 
   var sheet = spreadsheet.getSheets()[0];
@@ -739,8 +823,8 @@ function getOrCreateIndexSheet_(rootFolder) {
  * HYPERLINKにする（後者は、Drive全文検索のインデックス反映を待たずにAIがファイルへ
  * 直接ジャンプできるようにするための導線）。
  */
-function appendIndexRow_(rootFolder, savedAt, category, title, url, memo, fileUrl) {
-  var sheet = getOrCreateIndexSheet_(rootFolder);
+function appendIndexRow_(savedAt, category, title, url, memo, fileUrl) {
+  var sheet = getOrCreateIndexSheet_();
   // 自由入力由来の値（タイトル・メモ・カテゴリ）はセル値としてサニタイズする。
   // GASの appendRow/setValue は先頭が = の文字列を数式として解釈するため、
   // ページタイトルや共有メモに =IMPORTXML(...) 等が入っていると実行されてしまう。
