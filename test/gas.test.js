@@ -76,24 +76,50 @@ function createFolderStub(name) {
 
 /**
  * インメモリのスプレッドシート「シート」を作る。
- * appendRow / getRange().setFormula / getDataRange().getValues だけ実装する。
- * setFormula は =HYPERLINK("url","title") 形式を解釈し、表示値(title)をセルに反映する
- * （本物のSheetsが数式を計算表示するのと同じ見え方をNode側で再現するため）。
+ * 実際のSheetsに合わせ、表示値(getValues)と数式(getFormulas)を別々に保持する。
+ * - setFormula: 数式を記録しつつ、=HYPERLINK("url","title") は表示値(title)に反映する
+ *   （本物のSheetsが数式を計算表示するのと同じ見え方をNode側で再現するため）
+ * - getFormulas: 数式が入ったセルはその数式文字列、それ以外は '' を返す
+ *   （fileId抽出は Driveファイル列の HYPERLINK数式から行うため、この再現が必須）
  */
 function createSheetStub() {
-  const rows = [];
+  const rows = [];       // 表示値（getValues 用）
+  const formulas = [];   // 数式（getFormulas 用）。数式でないセルは ''
   return {
     _rows: rows,
-    appendRow(values) { rows.push(values.slice()); },
+    _formulas: formulas,
+    appendRow(values) {
+      rows.push(values.slice());
+      formulas.push(values.map(() => '')); // 追記直後は数式なし
+    },
     setFrozenRows() {},
     getLastRow() { return rows.length; },
-    getRange(row, col) {
+    getRange(row, col, numRows, numCols) {
       return {
         setFormula(formula) {
+          formulas[row - 1][col - 1] = formula;
+          // 表示値も更新（HYPERLINKなら表示テキスト、それ以外は数式文字列のまま）
           const m = formula.match(/HYPERLINK\("((?:[^"]|"")*)","((?:[^"]|"")*)"\)/);
-          if (m) {
-            rows[row - 1][col - 1] = m[2].replace(/""/g, '"');
+          rows[row - 1][col - 1] = m ? m[2].replace(/""/g, '"') : formula;
+        },
+        setValue(value) {
+          rows[row - 1][col - 1] = value;
+          formulas[row - 1][col - 1] = ''; // 値を入れると数式は消える（実挙動と同じ）
+        },
+        getValue() { return rows[row - 1][col - 1]; },
+        getFormulas() {
+          const rn = numRows || 1;
+          const cn = numCols || 1;
+          const out = [];
+          for (let r = 0; r < rn; r++) {
+            const line = [];
+            for (let c = 0; c < cn; c++) {
+              const fr = formulas[row - 1 + r];
+              line.push(fr ? (fr[col - 1 + c] || '') : '');
+            }
+            out.push(line);
           }
+          return out;
         }
       };
     },
@@ -121,7 +147,8 @@ function createDocStub(id, name) {
         setText(text) {
           handle.content = text;
           return this;
-        }
+        },
+        getText() { return handle.content; }
       };
     },
     saveAndClose() {}
@@ -208,6 +235,13 @@ function loadGasScript(options = {}) {
         const id = 'doc-' + (++docIdCounter);
         const handle = createDocStub(id, name);
         driveFilesById[id] = handle;
+        return handle;
+      },
+      openById(id) {
+        const handle = driveFilesById[id];
+        if (!handle || !handle._isDoc) {
+          throw new Error('スタブ: ドキュメントが見つかりません ' + id);
+        }
         return handle;
       }
     },

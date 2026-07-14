@@ -96,15 +96,17 @@
       border-color: #3949ab;
     }
 
-    /* 手動入力（テスト用・共有パラメータ無しで開いたとき） */
+    /* 手動入力（共有パラメータ無しで開いたとき＝PCブラウザからの新規保存） */
+    .manual-input-area { margin-bottom: 16px; }
     .manual-input {
       width: 100%;
       padding: 12px;
       border: 1px solid #c9cede;
       border-radius: 10px;
       font-size: 15px;
-      margin-bottom: 16px;
+      margin-bottom: 8px;
     }
+    .manual-input:last-child { margin-bottom: 0; }
 
     /* 設定画面 */
     .settings-panel { background: #fff; border-radius: 12px; padding: 16px; }
@@ -267,6 +269,39 @@
       cursor: pointer;
       margin-top: 4px;
     }
+
+    /* 記事1件の行（記事リンク＋編集ボタンの横並び） */
+    .list-item-row { display: flex; align-items: stretch; gap: 8px; margin-bottom: 10px; }
+    .list-item-row .list-item { flex: 1; margin-bottom: 0; }
+    .list-item-edit {
+      flex: 0 0 auto;
+      align-self: center;
+      border: 1px solid #3949ab;
+      color: #3949ab;
+      background: #fff;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      min-height: 44px;
+    }
+    .list-item-edit:active { background: #e8eaf6; }
+
+    /* ============================================================
+       レスポンシブ対応（PCブラウザ幅）
+       スマホ縦画面前提のスタイルは上で定義済み。ここでは画面が広いときだけ
+       上書きし、スマホ側の見た目・操作性には影響させない（メディアクエリ分岐）。
+       ============================================================ */
+    @media (min-width: 600px) {
+      /* コンテンツ幅を広げ、横長画面でも中央に読みやすい幅で表示する */
+      main { max-width: 720px; padding: 24px; }
+      /* カテゴリボタンは横に広いスペースを活かして3列にする */
+      .category-grid { grid-template-columns: repeat(3, 1fr); }
+      /* PCではポインタ操作のため、カテゴリボタン・記事にホバーの手がかりを出す */
+      .category-button:hover { border-color: #3949ab; background: #f0f2ff; }
+      .list-item:hover { border-color: #3949ab; }
+    }
   </style>
 </head>
 <body>
@@ -291,9 +326,13 @@
         <span class="label">保存する記事のURL</span>
         <span id="sharedUrlText"></span>
       </div>
-      <!-- 共有パラメータ無しで開いたとき用の手動入力欄 -->
-      <input id="manualUrlInput" class="manual-input hidden" type="url"
-             placeholder="https:// で始まるURLを入力（テスト用）">
+      <!-- 共有パラメータ無しで開いたとき用の手動入力欄（PCブラウザからの新規保存用） -->
+      <div id="manualInputArea" class="manual-input-area hidden">
+        <input id="manualUrlInput" class="manual-input" type="url"
+               placeholder="https:// で始まるURLを入力">
+        <input id="manualMemoInput" class="manual-input" type="text"
+               placeholder="メモ（任意）">
+      </div>
       <p class="section-title">カテゴリを選んで保存</p>
       <div id="categoryGrid" class="category-grid"></div>
     </div>
@@ -350,6 +389,22 @@
       <p id="errorDetail" class="detail"></p>
       <button id="retryButton" class="primary-button" type="button">カテゴリ選択に戻る</button>
     </div>
+
+    <!-- ビュー7: 記事の編集（一覧の「編集」から開く） -->
+    <div id="editView" class="hidden">
+      <button id="editBackButton" class="link-button" type="button">← 一覧に戻る</button>
+      <div class="settings-panel">
+        <p class="section-title">記事を編集</p>
+        <label for="editTitleInput">タイトル</label>
+        <input id="editTitleInput" type="text" placeholder="記事のタイトル">
+        <label for="editUrlInput">URL</label>
+        <input id="editUrlInput" type="url" placeholder="https:// で始まるURL">
+        <label for="editMemoInput">メモ（任意）</label>
+        <input id="editMemoInput" type="text" placeholder="メモ">
+        <p class="note">保存日時・カテゴリ・自動抽出された本文はそのまま保持されます。</p>
+        <button id="editSaveButton" class="primary-button" type="button">更新する</button>
+      </div>
+    </div>
   </main>
 
   <script>
@@ -371,7 +426,8 @@
 
     // カテゴリ一覧・Driveフォルダ URL は起動時に GAS から動的取得する（ハードコードしない）
     // listCategory / listItems は記事一覧画面の「さらに読み込む」用の表示中状態
-    var state = { categories: [], rootFolderUrl: '', listCategory: '', listItems: [] };
+    // editingItem は編集ビューで編集中の記事（fileId等）を保持する
+    var state = { categories: [], rootFolderUrl: '', listCategory: '', listItems: [], editingItem: null };
 
     // ============================================================
     // 共有パラメータの解析（純粋関数・テスト対象）
@@ -524,7 +580,7 @@
 
     var VIEW_IDS = [
       'mainView', 'settingsView', 'listCategoryView', 'listItemsView',
-      'doneView', 'errorView'
+      'doneView', 'errorView', 'editView'
     ];
 
     /** 指定したビューだけを表示し、他は隠す */
@@ -638,6 +694,13 @@
       var shared = parseSharedParams(location.search);
       if (shared.url) { return shared.url; }
       return document.getElementById('manualUrlInput').value.trim();
+    }
+
+    /** 現在の保存対象メモを返す（共有パラメータ優先、無ければ手動入力のメモ欄） */
+    function getCurrentMemo() {
+      var shared = parseSharedParams(location.search);
+      if (shared.url) { return shared.memo; }
+      return document.getElementById('manualMemoInput').value.trim();
     }
 
     /** 送信失敗をユーザーに知らせる（オフライン・送信キュー投入失敗時） */
@@ -829,6 +892,11 @@
       }
 
       items.forEach(function (item) {
+        // 記事1件は「記事リンク（a）＋編集ボタン」を横並びにした行（div）で構成する。
+        // 記事本体はタップで開けるリンクのまま維持し（スマホ操作性の非劣化）、右端に編集ボタンを添える。
+        var row = document.createElement('div');
+        row.className = 'list-item-row';
+
         var link = document.createElement('a');
         link.className = 'list-item';
         // http/https 以外（シートを手で編集した場合等）はリンクにしない防御
@@ -855,7 +923,20 @@
           link.appendChild(memo);
         }
 
-        container.appendChild(link);
+        row.appendChild(link);
+
+        // fileId のある記事（Docが特定できる記事）だけ編集可能にする。
+        // 旧データでDriveファイル列が空の行は fileId が無いため編集ボタンを出さない。
+        if (item.fileId) {
+          var editBtn = document.createElement('button');
+          editBtn.type = 'button';
+          editBtn.className = 'list-item-edit';
+          editBtn.textContent = '編集';
+          editBtn.addEventListener('click', function () { openEditView(item); });
+          row.appendChild(editBtn);
+        }
+
+        container.appendChild(row);
       });
 
       // まだ続きがある場合は末尾に「さらに読み込む」ボタンを出す
@@ -867,6 +948,72 @@
         moreButton.textContent = 'さらに読み込む';
         moreButton.addEventListener('click', loadMoreListItems);
         container.appendChild(moreButton);
+      }
+    }
+
+    // ============================================================
+    // 記事の編集（一覧の「編集」ボタンから開く）
+    // ============================================================
+
+    /** 編集ビューを開き、対象記事の内容を入力欄へセットする */
+    function openEditView(item) {
+      state.editingItem = item;
+      document.getElementById('editTitleInput').value = item.title || '';
+      document.getElementById('editUrlInput').value = item.url || '';
+      document.getElementById('editMemoInput').value = item.memo || '';
+      showView('editView');
+    }
+
+    /** 指定カテゴリの記事一覧キャッシュを破棄する（編集で内容が変わったとき用） */
+    function invalidateListCache(category) {
+      var cacheMap = loadCache(LIST_CACHE_KEY) || {};
+      if (cacheMap[category]) {
+        delete cacheMap[category];
+        saveCache(LIST_CACHE_KEY, cacheMap);
+      }
+    }
+
+    /**
+     * 編集内容をGASへ送信して保存する。
+     * 保存は fire-and-forget にせず応答を待つ（結果を確認して一覧へ反映するため）。
+     * 成功したら該当カテゴリのキャッシュを破棄し、一覧を取り直して戻る。
+     */
+    async function submitEdit() {
+      var item = state.editingItem;
+      if (!item || !item.fileId) {
+        alert('編集対象が不明です。一覧からやり直してください。');
+        return;
+      }
+
+      var title = document.getElementById('editTitleInput').value.trim();
+      var url = document.getElementById('editUrlInput').value.trim();
+      var memo = document.getElementById('editMemoInput').value.trim();
+
+      if (!title) { alert('タイトルを入力してください。'); return; }
+      if (!/^https?:\/\/\S+$/i.test(url)) {
+        alert('URLは https:// または http:// で始まる形式で入力してください。');
+        return;
+      }
+
+      var button = document.getElementById('editSaveButton');
+      button.disabled = true;
+      button.textContent = '更新中…';
+      try {
+        var result = await gasPost({
+          action: 'update', fileId: item.fileId, title: title, url: url, memo: memo
+        });
+        if (!result.ok) { throw new Error(result.error || '更新に失敗しました'); }
+
+        // 編集したカテゴリの一覧キャッシュは古くなるので破棄し、最新を取り直して戻る
+        var category = state.listCategory;
+        invalidateListCache(category);
+        await openListItemsView(category);
+      } catch (err) {
+        console.error('記事の更新に失敗しました:', err);
+        alert('更新に失敗しました: ' + String(err.message || err));
+      } finally {
+        button.disabled = false;
+        button.textContent = '更新する';
       }
     }
 
@@ -1025,6 +1172,13 @@
       });
       document.getElementById('listItemsBackButton').addEventListener('click', openListCategoryView);
 
+      // 記事編集ビュー: 更新ボタン・戻るボタン
+      document.getElementById('editSaveButton').addEventListener('click', submitEdit);
+      document.getElementById('editBackButton').addEventListener('click', function () {
+        // 編集をやめて一覧へ戻る（キャッシュ済みの一覧をそのまま表示）
+        openListItemsView(state.listCategory);
+      });
+
       // Driveショートカット（ナレッジフォルダを新規タブで開く）
       document.getElementById('driveShortcutButton').addEventListener('click', async function () {
         if (!loadSettings()) {
@@ -1069,8 +1223,12 @@
             alert('URLがありません。共有シートから開くか、URLを入力してください。');
             return;
           }
-          var shared = parseSharedParams(location.search);
-          submitToGas(url, category, shared.memo);
+          // URLの簡易検証（PCの手入力で https:// を付け忘れるケースの早期案内）
+          if (!/^https?:\/\/\S+$/i.test(url)) {
+            alert('URLは https:// または http:// で始まる形式で入力してください。');
+            return;
+          }
+          submitToGas(url, category, getCurrentMemo());
         });
       };
       await renderCategoriesWithRevalidate(renderGrid, function (err) {
@@ -1085,13 +1243,13 @@
 
       wireStaticEventListeners();
 
-      // 共有されたURLの表示（無ければ手動入力欄を出す）
+      // 共有されたURLの表示（無ければ手動入力欄を出す＝PCブラウザからの新規保存に対応）
       if (shared.url) {
         document.getElementById('sharedUrlText').textContent = shared.url;
       } else {
         document.getElementById('sharedUrlText').textContent =
-          '共有シートから開くとURLが自動で入ります';
-        document.getElementById('manualUrlInput').classList.remove('hidden');
+          '共有シートから開くか、下の欄にURLを入力して保存できます';
+        document.getElementById('manualInputArea').classList.remove('hidden');
       }
 
       // 共有テキストから検出したタイトルらしき文字列があれば表示（保存前の識別用）

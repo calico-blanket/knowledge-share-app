@@ -243,3 +243,70 @@ test('並び替えUI: ↑↓ボタンがあり、reorderCategoriesアクショ�
   assert.match(m[1], /'↓'/);
   assert.match(html, /action: 'reorderCategories'/, '並び順の保存はGAS側に永続化すること');
 });
+
+
+// ---- PC対応1: URL+メモ手入力フォーム ---------------------------------
+
+test('PC手入力: URL欄とメモ欄の両方があり、getCurrentMemoで手入力メモを取得できる', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /id="manualUrlInput"/);
+  assert.match(html, /id="manualMemoInput"/);
+  assert.match(html, /function getCurrentMemo\(\)/, '手入力メモ取得関数があること');
+  assert.match(html, /getElementById\('manualInputArea'\)\.classList\.remove\('hidden'\)/);
+});
+
+test('PC手入力: カテゴリ選択時にURL形式を検証し、getCurrentMemoを渡して保存する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function initMainView\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'initMainView関数が存在すること');
+  assert.match(m[1], /\^https\?:/, '手入力URLのスキームを検証すること');
+  assert.match(m[1], /submitToGas\(url, category, getCurrentMemo\(\)\)/, '手入力メモを保存に渡すこと');
+});
+
+// ---- PC対応3: 記事の編集 --------------------------------------------
+
+test('編集UI: 編集ビューと入力欄に必要なDOM idが揃っている', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  ['editView', 'editTitleInput', 'editUrlInput', 'editMemoInput', 'editSaveButton', 'editBackButton'].forEach(function (id) {
+    assert.match(html, new RegExp('id="' + id + '"'), 'id="' + id + '" が存在すること');
+  });
+  assert.match(html, /VIEW_IDS = \[[\s\S]*?'editView'[\s\S]*?\]/);
+});
+
+test('編集UI: 一覧の各記事にfileIdがあれば編集ボタンを生成する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function renderListItems\(items, hasMore\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderListItems関数が存在すること');
+  assert.match(m[1], /if \(item\.fileId\)/, 'fileIdがある記事だけ編集可能にすること');
+  assert.match(m[1], /openEditView\(item\)/, '編集ボタンで編集ビューを開くこと');
+  assert.match(m[1], /createElement\('button'\)/, '編集ボタンをDOM APIで生成すること');
+});
+
+test('編集UI: submitEditがupdateアクションをGASへ送り、成功後にキャッシュを破棄して再取得する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function submitEdit\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'submitEdit関数が存在すること');
+  assert.match(m[1], /action: 'update'/, 'updateアクションを送ること');
+  assert.match(m[1], /fileId: item\.fileId/, 'fileIdをキーに送ること');
+  assert.match(m[1], /\^https\?:/, 'URL形式を検証すること');
+  assert.match(m[1], /invalidateListCache/, '編集後にキャッシュを破棄すること');
+  assert.match(m[1], /await openListItemsView/, '編集後に一覧を取り直すこと');
+});
+
+test('編集UI: 編集は fire-and-forget にせず応答を待つ（gasPostをawaitする）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function submitEdit\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'submitEdit関数が存在すること');
+  assert.match(m[1], /await gasPost\(/, '編集は応答を待って結果を反映すること');
+});
+
+// ---- PC対応4: レスポンシブ -------------------------------------------
+
+test('レスポンシブ: PC幅向けのメディアクエリがあり、スマホ既定スタイルは維持される', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /main \{ padding: 16px; max-width: 480px;/, 'スマホ既定のmain幅が維持されていること');
+  assert.match(html, /@media \(min-width: 600px\)/, 'PC幅向けメディアクエリがあること');
+  const mq = html.match(/@media \(min-width: 600px\) \{([\s\S]*?)\n    \}/);
+  assert.ok(mq, 'メディアクエリの中身が取得できること');
+  assert.match(mq[1], /max-width: 720px/, 'PC幅ではコンテンツ幅を広げること');
+});
