@@ -122,6 +122,14 @@ function handleList_(category, token, offsetParam) {
     var sheet = getOrCreateIndexSheet_();
     var values = sheet.getDataRange().getValues(); // values[0] はヘッダ行
 
+    // Driveファイル列の数式（=HYPERLINK("…/document/d/{fileId}/edit","開く")）を取得し、
+    // 各記事の編集キーとなる fileId を抽出できるようにする。
+    // getValues では数式セルは表示値（"開く"）になり fileId が取れないため、別途 getFormulas で取る。
+    // fileFormulas[k] がシートの (k+2) 行目（＝ values[k+1]）に対応する。
+    var fileFormulas = values.length >= 2
+      ? sheet.getRange(2, INDEX_COL.FILE, values.length - 1, 1).getFormulas()
+      : [];
+
     var items = [];
     var matched = 0;   // このカテゴリで何件目まで見たか（offsetの読み飛ばし用）
     var hasMore = false;
@@ -139,11 +147,13 @@ function handleList_(category, token, offsetParam) {
         hasMore = true; // 1ページ分を超える該当行がまだある
         break;
       }
+      var fileFormula = fileFormulas[i - 1] ? fileFormulas[i - 1][0] : '';
       items.push({
         savedAt: row[INDEX_COL.SAVED_AT - 1],
         title: row[INDEX_COL.TITLE - 1],
         url: row[INDEX_COL.URL - 1],
-        memo: row[INDEX_COL.MEMO - 1] || ''
+        memo: row[INDEX_COL.MEMO - 1] || '',
+        fileId: extractFileIdFromFormula_(fileFormula)
       });
     }
 
@@ -162,6 +172,7 @@ function handleList_(category, token, offsetParam) {
  *   - addCategory      : { name } をカテゴリ一覧に追加
  *   - removeCategory   : { name } をカテゴリ一覧から削除（保存済みデータは残す）
  *   - reorderCategories: { categories } の順にカテゴリの並び順を変更
+ *   - update           : { fileId, title, url, memo? } 保存済み記事の内容を編集
  * すべての action 共通で token（合言葉）を検証する。
  */
 function doPost(e) {
@@ -179,6 +190,8 @@ function doPost(e) {
         return jsonResponse_(handleRemoveCategory_(body));
       case 'reorderCategories':
         return jsonResponse_(handleReorderCategories_(body));
+      case 'update':
+        return jsonResponse_(handleUpdate_(body));
       default:
         throw new Error('不明なactionです: ' + action);
     }
@@ -855,6 +868,119 @@ function appendIndexRow_(savedAt, category, title, url, memo, fileUrl) {
  */
 function escapeFormulaString_(text) {
   return String(text).replace(/"/g, '""');
+}
+
+/**
+ * Driveファイル列のHYPERLINK数式から GoogleドキュメントのfileIdを抽出する純粋関数。
+ * 例: '=HYPERLINK("https://docs.google.com/document/d/ABC123/edit","開く")' → 'ABC123'
+ * 数式が無い・URL形式でない場合は空文字を返す。
+ */
+function extractFileIdFromFormula_(formula) {
+  var m = String(formula || '').match(/document\/d\/([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : '';
+}
+
+// ---- 保存済み記事の編集（action=update） ----------------------
+
+/**
+ * 保存済み記事の内容（タイトル・URL・メモ）を編集する(action=update)。
+ * fileId（GoogleドキュメントのID）を一意キーに、Sheetsインデックスの該当行と
+ * 対応するGoogleドキュメント本文の両方を更新する。
+ *
+ * 行特定は「Sheetsインデックスに載っている記事のみ」に限定する（任意のfileIdで
+ * 自分のDrive上の無関係なファイルを触られないよう、一覧に存在する行だけを対象にする）。
+ * 保存日時とカテゴリは編集対象外で、Doc再構築時はSheets行の値をそのまま引き継ぐ。
+ * ドキュメントの「本文（自動抽出・参考）」節と「共有時のURL」行は保持する。
+ */
+function handleUpdate_(body) {
+  // ステップ1: 入力検証（save と同じ方針: http/https のみ、タイトル必須）
+  var fileId = String(body.fileId || '').trim();
+  var title = String(body.title || '').trim();
+  var url = String(body.url || '').trim();
+  var memo = String(body.memo || '').trim();
+
+  if (!fileId) {
+    throw new Error('編集対象が指定されていません');
+  }
+  if (!title) {
+    throw new Error('タイトルを入力してください');
+  }
+  if (!/^https?:\/\/\S+$/i.test(url)) {
+    throw new Error('URLの形式が不正です: ' + url);
+  }
+
+  // ステップ2: Sheetsインデックスから fileId 一致行を特定する
+  var sheet = getOrCreateIndexSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    throw new Error('編集対象の記事が見つかりません');
+  }
+  var fileFormulas = sheet.getRange(2, INDEX_COL.FILE, lastRow - 1, 1).getFormulas();
+  var targetRow = -1;
+  for (var i = 0; i < fileFormulas.length; i++) {
+    if (extractFileIdFromFormula_(fileFormulas[i][0]) === fileId) {
+      targetRow = i + 2; // ヘッダ1行 + 0始まりindex の分をずらして実際の行番号にする
+      break;
+    }
+  }
+  if (targetRow === -1) {
+    throw new Error('編集対象の記事が見つかりません');
+  }
+
+  // 保存日時・カテゴリは編集しないため、Doc再構築用に現在値をSheetsから引き継ぐ
+  var savedAt = String(sheet.getRange(targetRow, INDEX_COL.SAVED_AT).getValue());
+  var category = String(sheet.getRange(targetRow, INDEX_COL.CATEGORY).getValue());
+
+  // ステップ3: Sheets行を更新する（URL=平文、メモ=数式インジェクション対策、タイトル=HYPERLINK）
+  sheet.getRange(targetRow, INDEX_COL.URL).setValue(sanitizeCellText_(url));
+  sheet.getRange(targetRow, INDEX_COL.MEMO).setValue(sanitizeCellText_(memo));
+  sheet.getRange(targetRow, INDEX_COL.TITLE).setFormula(
+    '=HYPERLINK("' + escapeFormulaString_(url) + '","' + escapeFormulaString_(title) + '")'
+  );
+
+  // ステップ4: Googleドキュメント本文を更新する（自動抽出本文・共有時URLは保持）
+  var doc = DocumentApp.openById(fileId);
+  var currentText = doc.getBody().getText();
+  var newContent = rebuildDocContent_(currentText, savedAt, category, title, url, memo);
+  doc.getBody().setText(newContent);
+  doc.saveAndClose();
+
+  return { ok: true, fileId: fileId, title: title, url: url, memo: memo };
+}
+
+/**
+ * 既存ドキュメント本文を、新しいタイトル・URL・メモで組み立て直す純粋関数。
+ * 「本文（自動抽出・参考）」節と「共有時のURL」行は元テキストから抽出して引き継ぎ、
+ * 保存日時・カテゴリは呼び出し側（Sheets行由来）の値を使う。
+ * buildMarkdown_ を再利用するため、save 時と同じ本文フォーマットが保たれる。
+ */
+function rebuildDocContent_(currentText, savedAt, category, title, url, memo) {
+  var originalUrl = extractDocOriginalUrl_(currentText);
+  var bodyText = extractDocBodyText_(currentText);
+  return buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalUrl);
+}
+
+/**
+ * ドキュメント本文から「共有時のURL（短縮/リダイレクト元）」の値を抽出する純粋関数。
+ * 無ければ空文字を返す。
+ */
+function extractDocOriginalUrl_(text) {
+  var m = String(text || '').match(/^- 共有時のURL（短縮\/リダイレクト元）: (.+)$/m);
+  return m ? m[1].trim() : '';
+}
+
+/**
+ * ドキュメント本文から「本文（自動抽出・参考）」節の中身を抽出する純粋関数。
+ * 節見出し以降のテキスト（前後の空白を除く）を返す。節が無ければ空文字。
+ */
+function extractDocBodyText_(text) {
+  var marker = '## 本文（自動抽出・参考）';
+  var source = String(text || '');
+  var idx = source.indexOf(marker);
+  if (idx === -1) {
+    return '';
+  }
+  return source.substring(idx + marker.length).replace(/^\s+/, '').replace(/\s+$/, '');
 }
 
 /**
