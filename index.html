@@ -95,6 +95,11 @@
       background: #e8eaf6;
       border-color: #3949ab;
     }
+    /* カテゴリ選択中の状態（タップ即保存ではなく、確定ボタンまでの選択状態を示す） */
+    .category-button-selected {
+      background: #e8eaf6;
+      border-color: #3949ab;
+    }
 
     /* 手動入力（共有パラメータ無しで開いたとき＝PCブラウザからの新規保存） */
     .manual-input-area { margin-bottom: 16px; }
@@ -107,6 +112,33 @@
       margin-bottom: 8px;
     }
     .manual-input:last-child { margin-bottom: 0; }
+    /* メモ欄（共有・手動どちらの保存フローでも常に表示する） */
+    .memo-input-area { margin-bottom: 16px; }
+
+    /* タグ選択チップ: スマホの指でも押しやすいよう44px以上の高さを確保する */
+    .tag-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .tag-button {
+      min-height: 44px;
+      padding: 8px 16px;
+      border-radius: 20px;
+      border: 2px solid #c9cede;
+      background: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      color: #2f3650;
+      cursor: pointer;
+      -webkit-tap-highlight-color: rgba(57, 73, 171, 0.2);
+    }
+    .tag-button-selected {
+      background: #3949ab;
+      border-color: #3949ab;
+      color: #fff;
+    }
 
     /* 設定画面 */
     .settings-panel { background: #fff; border-radius: 12px; padding: 16px; }
@@ -142,6 +174,10 @@
       font-size: 16px;
       font-weight: 600;
       cursor: pointer;
+    }
+    .primary-button:disabled {
+      background: #c9cede;
+      cursor: default;
     }
     .secondary-button {
       display: block;
@@ -326,15 +362,21 @@
         <span class="label">保存する記事のURL</span>
         <span id="sharedUrlText"></span>
       </div>
-      <!-- 共有パラメータ無しで開いたとき用の手動入力欄（PCブラウザからの新規保存用） -->
+      <!-- 共有パラメータ無しで開いたとき用のURL手動入力欄（PCブラウザからの新規保存用） -->
       <div id="manualInputArea" class="manual-input-area hidden">
         <input id="manualUrlInput" class="manual-input" type="url"
                placeholder="https:// で始まるURLを入力">
+      </div>
+      <!-- メモ欄: 共有・手動どちらの保存フローでも常に表示する（任意項目） -->
+      <div class="memo-input-area">
         <input id="manualMemoInput" class="manual-input" type="text"
                placeholder="メモ（任意）">
       </div>
-      <p class="section-title">カテゴリを選んで保存</p>
+      <p class="section-title">カテゴリを選ぶ</p>
       <div id="categoryGrid" class="category-grid"></div>
+      <p class="section-title">タグ（任意・複数選択可）</p>
+      <div id="tagGrid" class="tag-grid"></div>
+      <button id="mainConfirmButton" class="primary-button" type="button" disabled>この内容で保存</button>
     </div>
 
     <!-- ビュー2: 設定画面（初回起動時・⚙タップ時） -->
@@ -357,6 +399,16 @@
             <button id="addCategoryButton" type="button">追加</button>
           </div>
           <p class="note">削除してもDriveに保存済みの記事は残ります。改名は「削除して追加」で対応してください。</p>
+        </div>
+
+        <div id="tagManageSection" class="settings-section hidden">
+          <p class="section-title">タグ管理</p>
+          <div id="tagManageList"></div>
+          <div class="category-add-row">
+            <input id="newTagInput" type="text" placeholder="新しいタグ名">
+            <button id="addTagButton" type="button">追加</button>
+          </div>
+          <p class="note">削除しても保存済み記事のタグは変わりません。</p>
         </div>
       </div>
     </div>
@@ -424,10 +476,15 @@
     // 記事一覧のキャッシュキー（カテゴリ名→先頭ページの内容、のマップを保存する）
     var LIST_CACHE_KEY = 'knowledgeShareListCache';
 
-    // カテゴリ一覧・Driveフォルダ URL は起動時に GAS から動的取得する（ハードコードしない）
+    // カテゴリ一覧・タグ一覧・Driveフォルダ URL は起動時に GAS から動的取得する（ハードコードしない）
     // listCategory / listItems は記事一覧画面の「さらに読み込む」用の表示中状態
     // editingItem は編集ビューで編集中の記事（fileId等）を保持する
-    var state = { categories: [], rootFolderUrl: '', listCategory: '', listItems: [], editingItem: null };
+    // selectedCategory / selectedTags は保存画面で選択中の内容（確定ボタンを押すまで保存しない）
+    var state = {
+      categories: [], tags: [], rootFolderUrl: '',
+      listCategory: '', listItems: [], editingItem: null,
+      selectedCategory: '', selectedTags: []
+    };
 
     // ============================================================
     // 共有パラメータの解析（純粋関数・テスト対象）
@@ -553,7 +610,7 @@
     }
 
     /**
-     * カテゴリのキャッシュを state に反映する。
+     * カテゴリ・タグのキャッシュを state に反映する。
      * キャッシュがあれば true（=即描画できる）、無ければ false を返す。
      */
     function primeCategoriesFromCache() {
@@ -562,14 +619,17 @@
         return false;
       }
       state.categories = cached.categories;
+      // tags は0件が正常な状態のため、無い場合のみ空配列（古い形式のキャッシュ対策）
+      state.tags = Array.isArray(cached.tags) ? cached.tags : [];
       state.rootFolderUrl = cached.rootFolderUrl || state.rootFolderUrl;
       return true;
     }
 
-    /** 現在の state のカテゴリ一覧をキャッシュへ書き戻す */
+    /** 現在の state のカテゴリ・タグ一覧をキャッシュへ書き戻す */
     function saveCategoriesCache() {
       saveCache(CATEGORIES_CACHE_KEY, {
         categories: state.categories,
+        tags: state.tags,
         rootFolderUrl: state.rootFolderUrl
       });
     }
@@ -631,11 +691,12 @@
       return response.json();
     }
 
-    /** カテゴリ一覧とDriveフォルダURLをGASから取得し、state とキャッシュに反映する */
+    /** カテゴリ一覧・タグ一覧・DriveフォルダURLをGASから取得し、state とキャッシュに反映する */
     async function fetchCategories() {
       var result = await gasGet('categories');
       if (!result.ok) { throw new Error(result.error || 'カテゴリの取得に失敗しました'); }
       state.categories = result.categories;
+      state.tags = result.tags || [];
       state.rootFolderUrl = result.rootFolderUrl;
       saveCategoriesCache();
       return result;
@@ -686,6 +747,82 @@
     }
 
     // ============================================================
+    // 保存画面のカテゴリ選択・タグ選択（確定ボタンを押すまで送信しない）
+    // ============================================================
+
+    /** 保存画面のカテゴリボタンを描画する。選択中のカテゴリはハイライトする */
+    function renderMainCategoryButtons() {
+      var grid = document.getElementById('categoryGrid');
+      grid.innerHTML = '';
+      if (!state.categories.length) {
+        grid.innerHTML = '<p class="empty-state">カテゴリがありません。設定画面から追加してください。</p>';
+        return;
+      }
+      state.categories.forEach(function (category) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'category-button';
+        if (category === state.selectedCategory) { button.classList.add('category-button-selected'); }
+        button.textContent = category;
+        button.addEventListener('click', function () { selectMainCategory(category); });
+        grid.appendChild(button);
+      });
+    }
+
+    /** カテゴリを選択状態にする（この時点ではまだ保存しない） */
+    function selectMainCategory(category) {
+      state.selectedCategory = category;
+      renderMainCategoryButtons();
+      updateMainConfirmButtonState();
+    }
+
+    /** 保存画面のタグボタン（複数選択チップ）を描画する */
+    function renderMainTagButtons() {
+      var grid = document.getElementById('tagGrid');
+      grid.innerHTML = '';
+      if (!state.tags.length) {
+        grid.innerHTML = '<p class="empty-state">タグはまだありません。設定画面から追加できます</p>';
+        return;
+      }
+      state.tags.forEach(function (tag) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tag-button';
+        var selected = state.selectedTags.indexOf(tag) !== -1;
+        if (selected) { button.classList.add('tag-button-selected'); }
+        button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        button.textContent = tag;
+        button.addEventListener('click', function () { toggleMainTag(tag); });
+        grid.appendChild(button);
+      });
+    }
+
+    /** タグの選択/選択解除を切り替える（複数選択可） */
+    function toggleMainTag(tag) {
+      var index = state.selectedTags.indexOf(tag);
+      if (index === -1) {
+        state.selectedTags.push(tag);
+      } else {
+        state.selectedTags.splice(index, 1);
+      }
+      renderMainTagButtons();
+    }
+
+    /** 確定ボタンの有効/無効を、カテゴリが選択されているかで切り替える */
+    function updateMainConfirmButtonState() {
+      document.getElementById('mainConfirmButton').disabled = !state.selectedCategory;
+    }
+
+    /** 保存画面の選択状態（カテゴリ・タグ）をリセットする（保存完了後・画面再表示時用） */
+    function resetMainSelection() {
+      state.selectedCategory = '';
+      state.selectedTags = [];
+      renderMainCategoryButtons();
+      renderMainTagButtons();
+      updateMainConfirmButtonState();
+    }
+
+    // ============================================================
     // 保存処理（GAS WebアプリへPOST）
     // ============================================================
 
@@ -696,11 +833,19 @@
       return document.getElementById('manualUrlInput').value.trim();
     }
 
-    /** 現在の保存対象メモを返す（共有パラメータ優先、無ければ手動入力のメモ欄） */
+    /**
+     * 現在の保存対象メモを返す。
+     * メモ欄は共有・手動どちらの保存フローでも常に表示される1つの入力欄なので、
+     * その内容をそのまま使う（共有時は検出したテキストを初期値として入れてあるが、
+     * ユーザーが確定前に自由に編集できる）。
+     */
     function getCurrentMemo() {
-      var shared = parseSharedParams(location.search);
-      if (shared.url) { return shared.memo; }
       return document.getElementById('manualMemoInput').value.trim();
+    }
+
+    /** 現在選択中のタグ一覧を返す（複数選択・0件可） */
+    function getCurrentTags() {
+      return state.selectedTags.slice();
     }
 
     /** 送信失敗をユーザーに知らせる（オフライン・送信キュー投入失敗時） */
@@ -711,20 +856,20 @@
     }
 
     /**
-     * カテゴリボタンが押されたときの保存処理（fire-and-forget 方式）。
+     * 確定ボタンが押されたときの保存処理（fire-and-forget 方式）。
      *
-     * GAS側はタイトル取得〜Google Docs保存の完了までに20〜30秒かかるが、
+     * GAS側はタイトル取得〜インデックス追記の完了までに数秒かかるが、
      * その応答を待たずに送信した時点で「保存しました」を表示する（体感1〜2秒）。
      * fetch に keepalive: true を付けることで、表示直後にPWAを閉じても
      * 送信自体はOS/ブラウザにより完了される。keepalive 非対応の環境では
      * navigator.sendBeacon（同じく閉じても送信が保証される）へフォールバックする。
      *
      * トレードオフ: GASの応答を見ないため、サーバー側の処理エラーはこの画面では
-     * 検知できない（カテゴリはサーバー由来の一覧から選ぶため実質発生しない）。
+     * 検知できない（カテゴリ・タグはサーバー由来の一覧から選ぶため実質発生しない）。
      * 検知するのは「送信そのものの失敗」（オフライン等）のみで、その場合は
      * エラー画面を表示する。
      */
-    function submitToGas(url, category, memo) {
+    function submitToGas(url, category, memo, tags) {
       var settings = loadSettings();
       if (!settings) {
         document.getElementById('errorDetail').textContent =
@@ -741,7 +886,7 @@
 
       var payload = JSON.stringify({
         token: settings.token || '', action: 'save',
-        url: url, category: category, memo: memo
+        url: url, category: category, memo: memo, tags: tags || []
       });
 
       // ステップ2: keepalive付きfetch → sendBeacon → 通常fetch の順で送信を試みる
@@ -786,6 +931,8 @@
       setTimeout(function () {
         if (!document.getElementById('doneView').classList.contains('hidden')) {
           showView('mainView');
+          resetMainSelection();
+          document.getElementById('manualMemoInput').value = '';
         }
       }, 1200);
     }
@@ -1098,12 +1245,13 @@
       }
     }
 
-    async function refreshCategoryManageUi() {
+    async function refreshManageUi() {
       document.getElementById('categoryManageSection').classList.remove('hidden');
+      document.getElementById('tagManageSection').classList.remove('hidden');
       await renderCategoriesWithRevalidate(
-        renderCategoryManageList,
+        function () { renderCategoryManageList(); renderTagManageList(); },
         function (err) {
-          console.warn('カテゴリ管理用の一覧取得に失敗:', err);
+          console.warn('カテゴリ・タグ管理用の一覧取得に失敗:', err);
         }
       );
     }
@@ -1138,6 +1286,110 @@
     }
 
     // ============================================================
+    // タグ管理（設定画面内。カテゴリ管理と同じ方式）
+    // ============================================================
+
+    function renderTagManageList() {
+      var container = document.getElementById('tagManageList');
+      container.innerHTML = '';
+      state.tags.forEach(function (name, index) {
+        var row = document.createElement('div');
+        row.className = 'category-manage-row';
+
+        var label = document.createElement('span');
+        label.className = 'category-name';
+        label.textContent = name;
+
+        var buttons = document.createElement('div');
+        buttons.className = 'category-row-buttons';
+
+        var upBtn = document.createElement('button');
+        upBtn.type = 'button';
+        upBtn.className = 'category-move-button';
+        upBtn.textContent = '↑';
+        upBtn.setAttribute('aria-label', name + ' を上へ');
+        upBtn.disabled = (index === 0);
+        upBtn.addEventListener('click', function () { handleMoveTag(index, -1); });
+
+        var downBtn = document.createElement('button');
+        downBtn.type = 'button';
+        downBtn.className = 'category-move-button';
+        downBtn.textContent = '↓';
+        downBtn.setAttribute('aria-label', name + ' を下へ');
+        downBtn.disabled = (index === state.tags.length - 1);
+        downBtn.addEventListener('click', function () { handleMoveTag(index, 1); });
+
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'category-remove-button';
+        removeBtn.textContent = '削除';
+        removeBtn.addEventListener('click', function () { handleRemoveTag(name); });
+
+        buttons.appendChild(upBtn);
+        buttons.appendChild(downBtn);
+        buttons.appendChild(removeBtn);
+        row.appendChild(label);
+        row.appendChild(buttons);
+        container.appendChild(row);
+      });
+    }
+
+    /** タグを1つ上/下へ移動する（カテゴリのhandleMoveCategoryと同じ方式） */
+    var tagReorderInFlight = false;
+    async function handleMoveTag(index, delta) {
+      if (tagReorderInFlight) { return; }
+      var previous = state.tags;
+      var next = moveArrayItem(previous, index, delta);
+      if (JSON.stringify(next) === JSON.stringify(previous)) { return; }
+
+      tagReorderInFlight = true;
+      state.tags = next;
+      renderTagManageList();
+      try {
+        var result = await gasPost({ action: 'reorderTags', tags: next });
+        if (!result.ok) { throw new Error(result.error || '並び替えに失敗しました'); }
+        state.tags = result.tags;
+        saveCategoriesCache();
+        renderTagManageList();
+      } catch (err) {
+        state.tags = previous;
+        renderTagManageList();
+        alert('並び替えの保存に失敗しました: ' + String(err.message || err));
+      } finally {
+        tagReorderInFlight = false;
+      }
+    }
+
+    async function handleAddTag() {
+      var input = document.getElementById('newTagInput');
+      var name = input.value.trim();
+      if (!name) { return; }
+      try {
+        var result = await gasPost({ action: 'addTag', name: name });
+        if (!result.ok) { throw new Error(result.error || '追加に失敗しました'); }
+        state.tags = result.tags;
+        saveCategoriesCache();
+        input.value = '';
+        renderTagManageList();
+      } catch (err) {
+        alert('タグの追加に失敗しました: ' + String(err.message || err));
+      }
+    }
+
+    async function handleRemoveTag(name) {
+      if (!confirm('「' + name + '」を削除しますか？（保存済み記事のタグは変わりません）')) { return; }
+      try {
+        var result = await gasPost({ action: 'removeTag', name: name });
+        if (!result.ok) { throw new Error(result.error || '削除に失敗しました'); }
+        state.tags = result.tags;
+        saveCategoriesCache();
+        renderTagManageList();
+      } catch (err) {
+        alert('タグの削除に失敗しました: ' + String(err.message || err));
+      }
+    }
+
+    // ============================================================
     // 初期化
     // ============================================================
 
@@ -1148,7 +1400,7 @@
         document.getElementById('gasUrlInput').value = current.gasUrl;
         document.getElementById('tokenInput').value = current.token || '';
         showView('settingsView');
-        if (current.gasUrl) { refreshCategoryManageUi(); }
+        if (current.gasUrl) { refreshManageUi(); }
       });
 
       document.getElementById('saveSettingsButton').addEventListener('click', async function () {
@@ -1164,6 +1416,10 @@
       });
 
       document.getElementById('addCategoryButton').addEventListener('click', handleAddCategory);
+      document.getElementById('addTagButton').addEventListener('click', handleAddTag);
+
+      // 保存画面の確定ボタン（カテゴリタップでは保存せず、ここで保存を実行する）
+      document.getElementById('mainConfirmButton').addEventListener('click', handleMainConfirm);
 
       // 一覧ボタン・戻るボタン
       document.getElementById('listButton').addEventListener('click', openListCategoryView);
@@ -1211,30 +1467,39 @@
     }
 
     /**
-     * 保存画面（メイン画面）のカテゴリボタンを描画する。
+     * 保存画面（メイン画面）のカテゴリ・タグボタンを描画する。
      * 前回取得したキャッシュがあれば即座に描画し（起動直後から保存操作できる）、
      * 裏でGASから最新一覧を取得して変化があれば描き直す。
+     * カテゴリタップでは保存せず、確定ボタン（mainConfirmButton）で保存する。
      */
     async function initMainView() {
       var renderGrid = function () {
-        renderCategoryButtons('categoryGrid', state.categories, function (category) {
-          var url = getCurrentUrl();
-          if (!url) {
-            alert('URLがありません。共有シートから開くか、URLを入力してください。');
-            return;
-          }
-          // URLの簡易検証（PCの手入力で https:// を付け忘れるケースの早期案内）
-          if (!/^https?:\/\/\S+$/i.test(url)) {
-            alert('URLは https:// または http:// で始まる形式で入力してください。');
-            return;
-          }
-          submitToGas(url, category, getCurrentMemo());
-        });
+        renderMainCategoryButtons();
+        renderMainTagButtons();
       };
       await renderCategoriesWithRevalidate(renderGrid, function (err) {
         document.getElementById('categoryGrid').innerHTML =
           '<p class="empty-state">カテゴリの取得に失敗しました: ' + escapeHtml(String(err.message || err)) + '</p>';
       });
+    }
+
+    /** 確定ボタン押下時のハンドラ。URL・カテゴリを検証してから保存を実行する */
+    function handleMainConfirm() {
+      var url = getCurrentUrl();
+      if (!url) {
+        alert('URLがありません。共有シートから開くか、URLを入力してください。');
+        return;
+      }
+      // URLの簡易検証（PCの手入力で https:// を付け忘れるケースの早期案内）
+      if (!/^https?:\/\/\S+$/i.test(url)) {
+        alert('URLは https:// または http:// で始まる形式で入力してください。');
+        return;
+      }
+      if (!state.selectedCategory) {
+        alert('カテゴリを選択してください。');
+        return;
+      }
+      submitToGas(url, state.selectedCategory, getCurrentMemo(), getCurrentTags());
     }
 
     async function init() {
@@ -1252,10 +1517,12 @@
         document.getElementById('manualInputArea').classList.remove('hidden');
       }
 
-      // 共有テキストから検出したタイトルらしき文字列があれば表示（保存前の識別用）
+      // 共有テキストから検出したタイトルらしき文字列があれば表示（保存前の識別用）。
+      // 同じ内容をメモ欄の初期値にも入れる（そのまま登録することも、編集することもできる）。
       if (shared.memo) {
         document.getElementById('titleHintText').textContent = shared.memo;
         document.getElementById('titleHintRow').classList.remove('hidden');
+        document.getElementById('manualMemoInput').value = shared.memo;
       }
 
       if (settings) {

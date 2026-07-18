@@ -150,7 +150,7 @@ test('GET保護: gasGetがtokenパラメータを付与している', () => {
 
 test('保存の高速化: fetchにkeepalive:trueが付いている（送信後にPWAを閉じても送信が完了する）', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const m = html.match(/function submitToGas\(url, category, memo\) \{([\s\S]*?)\n    \}/);
+  const m = html.match(/function submitToGas\(url, category, memo, tags\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'submitToGas関数が存在すること');
   assert.match(m[1], /keepalive: true/, 'fetchにkeepalive:trueを指定していること');
   assert.doesNotMatch(m[1], /await gasPost/, '応答を待つ旧実装(await gasPost)が復活していないこと');
@@ -158,7 +158,7 @@ test('保存の高速化: fetchにkeepalive:trueが付いている（送信後�
 
 test('保存の高速化: keepalive非対応環境向けに navigator.sendBeacon フォールバックがある', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const m = html.match(/function submitToGas\(url, category, memo\) \{([\s\S]*?)\n    \}/);
+  const m = html.match(/function submitToGas\(url, category, memo, tags\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'submitToGas関数が存在すること');
   assert.match(m[1], /navigator\.sendBeacon/, 'sendBeaconフォールバックがあること');
   assert.match(m[1], /text\/plain;charset=utf-8/, 'CORSプリフライトを避けるtext/plainで送ること');
@@ -255,12 +255,16 @@ test('PC手入力: URL欄とメモ欄の両方があり、getCurrentMemoで手�
   assert.match(html, /getElementById\('manualInputArea'\)\.classList\.remove\('hidden'\)/);
 });
 
-test('PC手入力: カテゴリ選択時にURL形式を検証し、getCurrentMemoを渡して保存する', () => {
+test('確定ボタン押下時: URL形式・カテゴリ選択済みを検証し、メモ・タグとともに保存する', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const m = html.match(/async function initMainView\(\) \{([\s\S]*?)\n    \}/);
-  assert.ok(m, 'initMainView関数が存在すること');
+  const m = html.match(/function handleMainConfirm\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'handleMainConfirm関数が存在すること');
   assert.match(m[1], /\^https\?:/, '手入力URLのスキームを検証すること');
-  assert.match(m[1], /submitToGas\(url, category, getCurrentMemo\(\)\)/, '手入力メモを保存に渡すこと');
+  assert.match(m[1], /state\.selectedCategory/, 'カテゴリが選択済みかを検証すること');
+  assert.match(
+    m[1], /submitToGas\(url, state\.selectedCategory, getCurrentMemo\(\), getCurrentTags\(\)\)/,
+    'メモ・タグを渡して保存すること'
+  );
 });
 
 // ---- PC対応3: 記事の編集 --------------------------------------------
@@ -309,4 +313,83 @@ test('レスポンシブ: PC幅向けのメディアクエリがあり、スマ�
   const mq = html.match(/@media \(min-width: 600px\) \{([\s\S]*?)\n    \}/);
   assert.ok(mq, 'メディアクエリの中身が取得できること');
   assert.match(mq[1], /max-width: 720px/, 'PC幅ではコンテンツ幅を広げること');
+});
+
+// ---- メモ確定フロー: カテゴリタップでは保存せず、確定ボタンで保存する ---
+
+test('メモ欄: 共有・手動どちらのモードでも常に表示される（manualInputAreaの外にある）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const manualArea = html.match(/<div id="manualInputArea"[\s\S]*?<\/div>/);
+  assert.ok(manualArea, 'manualInputAreaが存在すること');
+  assert.doesNotMatch(manualArea[0], /id="manualMemoInput"/, 'メモ欄はmanualInputAreaの外に出ていること（常に表示するため）');
+  assert.match(html, /id="manualMemoInput"/, 'メモ欄自体は存在すること');
+});
+
+test('メモ欄: 共有テキストから検出した内容がメモ欄の初期値として入る', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function init\(\) \{([\s\S]*?)\n\s*init\(\);/);
+  assert.ok(m, 'init関数が存在すること');
+  assert.match(
+    m[1], /getElementById\('manualMemoInput'\)\.value = shared\.memo/,
+    '共有検出テキストをメモ欄へ初期値としてセットすること'
+  );
+});
+
+test('カテゴリタップでは即保存せず、選択状態にするだけ（selectMainCategory）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function renderMainCategoryButtons\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderMainCategoryButtons関数が存在すること');
+  assert.match(m[1], /selectMainCategory\(category\)/, 'タップ時はselectMainCategoryを呼ぶこと（即submitToGasしない）');
+  assert.doesNotMatch(m[1], /submitToGas/, 'カテゴリボタンのハンドラが直接保存しないこと');
+});
+
+test('確定ボタン: カテゴリ未選択のときはdisabledになる', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /id="mainConfirmButton"[^>]*disabled/, '初期状態はdisabledであること');
+  const m = html.match(/function updateMainConfirmButtonState\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'updateMainConfirmButtonState関数が存在すること');
+  assert.match(m[1], /!state\.selectedCategory/, 'カテゴリ未選択かどうかで有効\/無効を切り替えること');
+});
+
+test('保存完了後、選択状態とメモ欄がリセットされる（resetMainSelection）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /function resetMainSelection\(\) \{/, 'resetMainSelection関数が存在すること');
+  const m = html.match(/setTimeout\(function \(\) \{([\s\S]*?)\}, 1200\)/);
+  assert.ok(m, '保存後の遷移処理が存在すること');
+  assert.match(m[1], /resetMainSelection\(\)/, '保存完了後にリセットすること');
+});
+
+// ---- タグ複数選択UI ----------------------------------------------------
+
+test('タグUI: タグボタンの複数選択チップが描画され、確定時にsubmitToGasへ渡される', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /id="tagGrid"/, 'タグ表示用のコンテナがあること');
+  const render = html.match(/function renderMainTagButtons\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(render, 'renderMainTagButtons関数が存在すること');
+  assert.match(render[1], /toggleMainTag\(tag\)/, 'タップでtoggleMainTagを呼ぶこと');
+
+  const toggle = html.match(/function toggleMainTag\(tag\) \{([\s\S]*?)\n    \}/);
+  assert.ok(toggle, 'toggleMainTag関数が存在すること（複数選択のトグル）');
+
+  assert.match(html, /function getCurrentTags\(\) \{([\s\S]*?)\n    \}/, 'getCurrentTags関数が存在すること');
+});
+
+test('タグ管理（設定画面）: 追加・削除・並び替えのGASアクションを送る関数が揃っている', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  ['tagManageSection', 'tagManageList', 'newTagInput', 'addTagButton'].forEach(function (id) {
+    assert.match(html, new RegExp('id="' + id + '"'), 'id="' + id + '" が存在すること');
+  });
+  assert.match(html, /action: 'addTag'/, 'addTagアクションを送ること');
+  assert.match(html, /action: 'removeTag'/, 'removeTagアクションを送ること');
+  assert.match(html, /action: 'reorderTags'/, 'reorderTagsアクションを送ること');
+});
+
+test('カテゴリ・タグ管理: 設定画面を開くと両方のセクションがまとめて表示・取得される（refreshManageUi）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function refreshManageUi\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'refreshManageUi関数が存在すること');
+  assert.match(m[1], /categoryManageSection/);
+  assert.match(m[1], /tagManageSection/);
+  assert.match(m[1], /renderCategoryManageList\(\)/);
+  assert.match(m[1], /renderTagManageList\(\)/);
 });
