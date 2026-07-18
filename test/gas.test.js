@@ -5,6 +5,11 @@
 //   スタブに差し替えた vm コンテキストで Code.gs 本物を実行し、
 //   doPost の全経路（正常系・フォールバック・異常系）を検証する。
 //
+//   このスクリプトは「ナレッジ一覧」スプレッドシートにコンテナバインドされている
+//   前提のため、SpreadsheetApp スタブは getActiveSpreadsheet() のみを提供する
+//   （openById / create は提供しない。Code.gs がこれらを呼び出せば
+//   「関数ではありません」エラーとしてテストが失敗し、回帰を検知できる）。
+//
 //   実行方法: node --test test/
 // ============================================================
 
@@ -20,7 +25,9 @@ const vm = require('node:vm');
 
 /**
  * インメモリの Drive フォルダを作る。
- * GAS の Folder オブジェクトのうち Code.gs が使うメソッドだけ実装する。
+ * GAS の Folder オブジェクトのうち Code.gs が使うメソッドだけ実装する
+ * （記事保存はSheetsのみで完結するため、フォルダはDriveショートカット用の
+ *   「ナレッジ」ルートフォルダの取得・作成でしか使われない）。
  */
 let folderIdCounter = 0;
 
@@ -29,8 +36,6 @@ function createFolderStub(name) {
     name,
     id: 'folder-' + (++folderIdCounter),
     subFolders: [],
-    files: [],
-    driveFiles: [], // addFile/removeFile で管理する汎用ファイル参照（Sheets移動用）
     getId() { return folder.id; },
     isTrashed() { return false; },
     getFoldersByName(target) {
@@ -42,33 +47,8 @@ function createFolderStub(name) {
       folder.subFolders.push(child);
       return child;
     },
-    getFilesByName(target) {
-      const hits = folder.files.filter((f) => f.name === target);
-      return makeIterator(hits);
-    },
-    createFile(fileName, content, mimeType) {
-      const file = { name: fileName, content, mimeType, getId: () => 'file-' + fileName };
-      folder.files.push(file);
-      return file;
-    },
     getUrl() {
       return 'https://drive.google.com/drive/folders/stub-' + encodeURIComponent(name);
-    },
-    addFile(fileHandle) {
-      folder.driveFiles.push(fileHandle);
-      // Googleドキュメント（DocumentApp.create相当）の場合は、既存の files 配列にも
-      // 登録する。同一オブジェクト参照なので、後から doc.getBody().setText() で
-      // 更新される content もテスト側からそのまま参照できる（実際のDrive APIでも
-      // getFilesByName はファイル種別を問わず名前一致で見つかる）。
-      if (fileHandle._isDoc) {
-        folder.files.push(fileHandle);
-      }
-      return folder;
-    },
-    removeFile(fileHandle) {
-      const idx = folder.driveFiles.indexOf(fileHandle);
-      if (idx !== -1) { folder.driveFiles.splice(idx, 1); }
-      return folder;
     }
   };
   return folder;
@@ -106,7 +86,10 @@ function createSheetStub() {
           rows[row - 1][col - 1] = value;
           formulas[row - 1][col - 1] = ''; // 値を入れると数式は消える（実挙動と同じ）
         },
-        getValue() { return rows[row - 1][col - 1]; },
+        getValue() {
+          const line = rows[row - 1];
+          return line ? line[col - 1] : undefined;
+        },
         getFormulas() {
           const rn = numRows || 1;
           const cn = numCols || 1;
@@ -131,15 +114,13 @@ function createSheetStub() {
 
 /**
  * インメモリの Googleドキュメント「ハンドル」を作る。
- * getBody().setText() で content プロパティを直接更新する（folder.files に登録された
- * 同一オブジェクトからも参照できるようにするため、別オブジェクトへコピーしない）。
+ * 記事保存(save)ではもう使わないが、過去に保存されたGoogleドキュメントの
+ * 編集(action=update)は引き続きサポートするため、テストの legacy fixture 用に残す。
  */
 function createDocStub(id, name) {
   const handle = {
-    _isDoc: true,
     name,
     content: '',
-    mimeType: 'application/vnd.google-apps.document',
     getId: () => id,
     getUrl: () => 'https://docs.google.com/document/d/' + id + '/edit',
     getBody() {
@@ -193,53 +174,40 @@ function makeFetchResponse({ code = 200, body = '', headers = {} }) {
 function loadGasScript(options = {}) {
   const rootFolder = createFolderStub('(root)');
   const fetchCalls = [];
-  const driveFilesById = {}; // ファイルID -> ハンドル（SpreadsheetApp.create が登録する）
-  const spreadsheetsById = {}; // スプレッドシートID -> {getId, getSheets}
-  let spreadsheetIdCounter = 0;
+  const docsById = {}; // ドキュメントID -> ハンドル（DocumentApp.create/openById共有）
   let docIdCounter = 0;
   const scriptProps = Object.assign({}, options.scriptProperties || {});
 
+  // コンテナバインド前提: アクティブなスプレッドシート（＝バインド先本体）は1つだけ、
+  // 最初は空のシートを1枚持つ状態で存在する。
+  const activeSheet = createSheetStub();
+  const activeSpreadsheet = { getSheets: () => [activeSheet] };
+
   const context = {
-    // --- DriveApp スタブ ---
+    // --- DriveApp スタブ（Driveショートカット用のルートフォルダ取得のみで使用） ---
     DriveApp: {
       getRootFolder: () => rootFolder,
       getFolderById(id) {
-        // ルートフォルダ自身はIDで開けない想定にする（Code.gsは「ナレッジ」フォルダのIDしか渡さない）
         const hit = findFolderById(rootFolder, id);
         if (!hit || hit === rootFolder) { throw new Error('スタブ: フォルダが見つかりません ' + id); }
         return hit;
-      },
-      getFileById(id) {
-        if (!driveFilesById[id]) { throw new Error('スタブ: ファイルが見つかりません ' + id); }
-        return driveFilesById[id];
       }
     },
-    // --- SpreadsheetApp スタブ ---
+    // --- SpreadsheetApp スタブ（コンテナバインド: getActiveSpreadsheetのみ提供） ---
     SpreadsheetApp: {
-      create(name) {
-        const id = 'ss-' + (++spreadsheetIdCounter);
-        const sheet = createSheetStub();
-        const spreadsheet = { getId: () => id, getSheets: () => [sheet], _sheet: sheet };
-        spreadsheetsById[id] = spreadsheet;
-        driveFilesById[id] = { getId: () => id, name: name };
-        return spreadsheet;
-      },
-      openById(id) {
-        if (!spreadsheetsById[id]) { throw new Error('スタブ: スプレッドシートが見つかりません ' + id); }
-        return spreadsheetsById[id];
-      }
+      getActiveSpreadsheet: () => activeSpreadsheet
     },
-    // --- DocumentApp スタブ ---
+    // --- DocumentApp スタブ（過去に保存されたGoogleドキュメントの編集(update)用） ---
     DocumentApp: {
       create(name) {
         const id = 'doc-' + (++docIdCounter);
         const handle = createDocStub(id, name);
-        driveFilesById[id] = handle;
+        docsById[id] = handle;
         return handle;
       },
       openById(id) {
-        const handle = driveFilesById[id];
-        if (!handle || !handle._isDoc) {
+        const handle = docsById[id];
+        if (!handle) {
           throw new Error('スタブ: ドキュメントが見つかりません ' + id);
         }
         return handle;
@@ -293,7 +261,7 @@ function loadGasScript(options = {}) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
   vm.runInContext(source, context);
 
-  return { context, rootFolder, fetchCalls, spreadsheetsById };
+  return { context, rootFolder, fetchCalls, sheet: activeSheet };
 }
 
 /** doPost をJSONボディ付きで呼び、レスポンスJSONをパースして返す */
@@ -316,10 +284,30 @@ function callDoGetCategories(context, token) {
   return JSON.parse(output.getContent());
 }
 
-// ---- 正常系 --------------------------------------------------
+/**
+ * 「移行前（コンテナバインド化・タグ機能追加より前）に保存された記事」を
+ * インデックスシートとGoogleドキュメントの両方に直接作り込む。
+ * 現在の save フローはもうGoogleドキュメントを作らないため、
+ * action=update（既存ドキュメントの編集）をテストするにはこの関数で
+ * legacy な状態を再現する。
+ */
+function seedLegacyArticle(context, { savedAt, category, title, url, memo }) {
+  const sheet = context.getOrCreateIndexSheet_();
+  const doc = context.DocumentApp.create(title);
+  doc.getBody().setText(context.buildMarkdown_(title, url, savedAt, category, memo || '', '', ''));
 
-test('正常系: タイトル取得 → ナレッジ/カテゴリ/ に「タイトル_日付」のドキュメントで保存される', () => {
-  const { context, rootFolder } = loadGasScript({
+  sheet.appendRow([savedAt, category, title, url, memo || '', '', '']);
+  const lastRow = sheet.getLastRow();
+  sheet.getRange(lastRow, 3).setFormula('=HYPERLINK("' + url + '","' + title + '")');
+  sheet.getRange(lastRow, 6).setFormula('=HYPERLINK("' + doc.getUrl() + '","開く")');
+
+  return { fileId: doc.getId(), sheet, lastRow };
+}
+
+// ---- 正常系（保存はSheetsインデックスのみ・Googleドキュメントは作らない） ----
+
+test('正常系: タイトル取得 → Sheetsインデックスに1行追記される（Googleドキュメントは作らない）', () => {
+  const { context, sheet } = loadGasScript({
     fetchImpl: () => makeFetchResponse({ body: '<html><head><title>テスト記事のタイトル</title></head></html>' })
   });
 
@@ -327,58 +315,36 @@ test('正常系: タイトル取得 → ナレッジ/カテゴリ/ に「タイ�
 
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.title, 'テスト記事のタイトル');
-  assert.match(result.fileName, /^テスト記事のタイトル_\d{4}-\d{2}-\d{2}$/);
-  assert.strictEqual(result.folderPath, 'ナレッジ/PC系');
+  assert.strictEqual(result.category, 'PC系');
+  assert.deepStrictEqual(Array.from(result.tags), []);
 
-  // Drive 側の実体を確認: ナレッジ → PC系 → ファイル1件
-  const knowledge = rootFolder.subFolders.find((f) => f.name === 'ナレッジ');
-  assert.ok(knowledge, 'ナレッジフォルダが作成されている');
-  const category = knowledge.subFolders.find((f) => f.name === 'PC系');
-  assert.ok(category, 'カテゴリフォルダが作成されている');
-  assert.strictEqual(category.files.length, 1);
-
-  // ファイル内容にタイトル・URL・保存日時・カテゴリが含まれる
-  const content = category.files[0].content;
-  assert.match(content, /^# テスト記事のタイトル/);
-  assert.match(content, /- URL: https:\/\/example\.com\/article/);
-  assert.match(content, /- 保存日時: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
-  assert.match(content, /- カテゴリ: PC系/);
+  assert.strictEqual(sheet._rows.length, 2, 'ヘッダ行 + データ1行');
+  assert.deepStrictEqual(
+    Array.from(sheet._rows[0]),
+    ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル', 'タグ']
+  );
+  assert.strictEqual(sheet._rows[1][1], 'PC系');
+  assert.strictEqual(sheet._rows[1][2], 'テスト記事のタイトル'); // HYPERLINKの表示値
+  assert.strictEqual(sheet._rows[1][3], 'https://example.com/article');
+  assert.strictEqual(sheet._rows[1][5], '', 'Driveファイル列は新規保存では常に空');
 });
 
-test('正常系: メモ付きで保存するとメモ節が追加される', () => {
-  const { context, rootFolder } = loadGasScript();
+test('正常系: メモ付きで保存するとメモ列に反映される', () => {
+  const { context, sheet } = loadGasScript();
   const result = callDoPost(context, {
-    url: 'https://example.com/',
-    category: '自由掲示板',
-    memo: 'あとで読む'
+    url: 'https://example.com/', category: '自由掲示板', memo: 'あとで読む'
   });
   assert.strictEqual(result.ok, true);
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.match(file.content, /## メモ\n\nあとで読む/);
+  assert.strictEqual(sheet._rows[1][4], 'あとで読む');
 });
 
-test('正常系: 既存フォルダがあれば再利用され、二重に作られない', () => {
-  const { context, rootFolder } = loadGasScript();
+test('正常系: 2回目以降の保存でもヘッダー行は重複せず、行が追記されていく', () => {
+  const { context, sheet } = loadGasScript();
   callDoPost(context, { url: 'https://example.com/1', category: 'DTP系' });
   callDoPost(context, { url: 'https://example.com/2', category: 'DTP系' });
 
-  const knowledgeFolders = rootFolder.subFolders.filter((f) => f.name === 'ナレッジ');
-  assert.strictEqual(knowledgeFolders.length, 1, 'ナレッジフォルダは1つだけ');
-  const categoryFolders = knowledgeFolders[0].subFolders.filter((f) => f.name === 'DTP系');
-  assert.strictEqual(categoryFolders.length, 1, 'カテゴリフォルダは1つだけ');
-});
-
-test('正常系: 同名ファイルが既にある場合は時刻付きの別名になり上書きされない', () => {
-  const { context, rootFolder } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>同じタイトル</title>' })
-  });
-  callDoPost(context, { url: 'https://example.com/a', category: 'PC系' });
-  callDoPost(context, { url: 'https://example.com/b', category: 'PC系' });
-
-  const files = rootFolder.subFolders[0].subFolders[0].files;
-  assert.strictEqual(files.length, 2, '2ファイルとも保存される');
-  assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名が衝突しない');
-  assert.match(files[1].name, /^同じタイトル_\d{4}-\d{2}-\d{2}_\d{6}$/);
+  assert.strictEqual(sheet._rows.length, 3, 'ヘッダ + データ2行');
+  assert.deepStrictEqual(Array.from(sheet._rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル', 'タグ']);
 });
 
 // ---- タイトル取得のフォールバック -----------------------------
@@ -434,34 +400,6 @@ test('extractTitle_: 属性付き title タグでも抽出できる', () => {
   assert.strictEqual(context.extractTitle_('<title data-rh="true">属性付き</title>'), '属性付き');
 });
 
-// ---- ファイル名の純粋関数 -------------------------------------
-
-test('sanitizeFileName_: Windows禁止文字がスペースに置換される', () => {
-  const { context } = loadGasScript();
-  assert.strictEqual(
-    context.sanitizeFileName_('a/b\\c:d*e?f"g<h>i|j'),
-    'a b c d e f g h i j'
-  );
-});
-
-test('buildFileName_: 空タイトルは「無題」になる', () => {
-  const { context } = loadGasScript();
-  assert.strictEqual(context.buildFileName_('', '2026-07-12'), '無題_2026-07-12');
-});
-
-test('buildFileName_: 長すぎるタイトルは切り詰められる', () => {
-  const { context } = loadGasScript();
-  const longTitle = 'あ'.repeat(200);
-  const name = context.buildFileName_(longTitle, '2026-07-12');
-  assert.ok(name.length < 100, '切り詰め後のファイル名が十分短い: ' + name.length);
-  assert.match(name, /^あ+…_2026-07-12$/);
-});
-
-test('buildFileName_: タイトルが先頭、日付が末尾になる（Drive一覧でタイトルが読みやすいように）', () => {
-  const { context } = loadGasScript();
-  assert.strictEqual(context.buildFileName_('記事タイトル', '2026-07-12'), '記事タイトル_2026-07-12');
-});
-
 // ---- 異常系（入力バリデーション） ------------------------------
 
 test('異常系: URL 無しはエラー', () => {
@@ -479,11 +417,11 @@ test('異常系: javascript: スキームは拒否される', () => {
 });
 
 test('異常系: 許可リストにないカテゴリは拒否される', () => {
-  const { context, rootFolder } = loadGasScript();
+  const { context, sheet } = loadGasScript();
   const result = callDoPost(context, { url: 'https://example.com/', category: '../etc' });
   assert.strictEqual(result.ok, false);
   assert.match(result.error, /不明なカテゴリです/);
-  assert.strictEqual(rootFolder.subFolders.length, 0, 'フォルダは作られない');
+  assert.strictEqual(sheet._rows.length, 0, '行は追記されない');
 });
 
 test('異常系: ボディが JSON でない場合はエラー', () => {
@@ -504,13 +442,13 @@ test('異常系: ボディ無し（e が空）でもエラーJSONを返して落
 // ---- 合言葉（SHARED_TOKEN） -----------------------------------
 
 test('token: SHARED_TOKEN 設定時、一致しないと拒否される', () => {
-  const { context, rootFolder } = loadGasScript({
+  const { context, sheet } = loadGasScript({
     scriptProperties: { SHARED_TOKEN: 'himitsu' }
   });
   const ng = callDoPost(context, { url: 'https://example.com/', category: 'PC系', token: 'wrong' });
   assert.strictEqual(ng.ok, false);
   assert.match(ng.error, /合言葉が一致しません/);
-  assert.strictEqual(rootFolder.subFolders.length, 0, '保存されない');
+  assert.strictEqual(sheet._rows.length, 0, '保存されない');
 
   const ok = callDoPost(context, { url: 'https://example.com/', category: 'PC系', token: 'himitsu' });
   assert.strictEqual(ok.ok, true);
@@ -524,8 +462,8 @@ test('token: SHARED_TOKEN 未設定なら token 無しでも通る', () => {
 
 // ---- 全カテゴリの網羅確認 -------------------------------------
 
-test('カテゴリ: 初期リスト10件すべてが受理され、同名フォルダが作られる', () => {
-  const { context, rootFolder } = loadGasScript();
+test('カテゴリ: 初期リスト10件すべてが受理され、Sheetsに1行ずつ追記される', () => {
+  const { context, sheet } = loadGasScript();
   const expected = [
     '業務マニュアル', '自由掲示板', 'PC系', 'DTP系', 'その他PC学習、スキル',
     'PCニュース', '語学系', '英語・中国語', 'レシピ、お店', 'TOCO/お知らせ'
@@ -534,41 +472,10 @@ test('カテゴリ: 初期リスト10件すべてが受理され、同名フォ�
     const result = callDoPost(context, { url: 'https://example.com/', category: cat });
     assert.strictEqual(result.ok, true, cat + ' が受理される');
   }
-  const knowledge = rootFolder.subFolders.find((f) => f.name === 'ナレッジ');
-  const folderNames = knowledge.subFolders.map((f) => f.name);
-  assert.deepStrictEqual(folderNames.sort(), [...expected].sort());
+  assert.strictEqual(sheet._rows.length, 1 + expected.length, 'ヘッダ + 10行');
 });
 
-// ---- 検索用インデックス（Sheets）と一覧API -----------------------
-
-test('インデックス: 保存すると同時にSheetsへ1行追記される（初回はシートも自動作成）', () => {
-  const { context, spreadsheetsById } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>索引テスト記事</title>' })
-  });
-
-  callDoPost(context, { url: 'https://example.com/idx', category: 'PC系', memo: 'メモA' });
-
-  const ids = Object.keys(spreadsheetsById);
-  assert.strictEqual(ids.length, 1, 'スプレッドシートが1つだけ作られる');
-  const rows = spreadsheetsById[ids[0]]._sheet._rows;
-  assert.strictEqual(rows.length, 2, 'ヘッダ行 + データ1行');
-  // vm(別レルム)の配列と比較するため、prototypeを問わない Array.from で正規化してから比較する
-  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
-  assert.strictEqual(rows[1][1], 'PC系');
-  assert.strictEqual(rows[1][2], '索引テスト記事'); // HYPERLINKの表示値(タイトル)
-  assert.strictEqual(rows[1][3], 'https://example.com/idx');
-  assert.strictEqual(rows[1][4], 'メモA');
-});
-
-test('インデックス: 2回目以降の保存はスプレッドシートを作り直さず追記する', () => {
-  const { context, spreadsheetsById } = loadGasScript();
-  callDoPost(context, { url: 'https://example.com/1', category: 'PC系' });
-  callDoPost(context, { url: 'https://example.com/2', category: 'DTP系' });
-
-  assert.strictEqual(Object.keys(spreadsheetsById).length, 1, 'スプレッドシートは1つのまま');
-  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
-  assert.strictEqual(rows.length, 3, 'ヘッダ + データ2行');
-});
+// ---- 一覧API -----------------------------------------------------
 
 test('一覧API: 指定カテゴリの保存済み記事のみを新しい順に返す', () => {
   const { context } = loadGasScript();
@@ -628,25 +535,15 @@ test('escapeFormulaString_: ダブルクォートが二重化される（数式�
   );
 });
 
-test('インデックス追記が失敗しても doPost 自体は成功として返す（本体保存を優先）', () => {
-  const { context, rootFolder } = loadGasScript();
-  // SpreadsheetApp.create を壊して、インデックス追記だけ失敗させる
-  context.SpreadsheetApp.create = () => { throw new Error('スタブ: 意図的な失敗'); };
-
-  const result = callDoPost(context, { url: 'https://example.com/x', category: 'PC系' });
-  assert.strictEqual(result.ok, true, 'Markdown保存が成功していればokはtrue');
-  const category = rootFolder.subFolders[0].subFolders[0];
-  assert.strictEqual(category.files.length, 1, 'Markdownファイルは保存されている');
-});
-
 // ---- カテゴリ管理（動的CRUD） -----------------------------------
 
-test('categories API: 初回アクセスでデフォルト10カテゴリが返る', () => {
+test('categories API: 初回アクセスでデフォルト10カテゴリ・空のタグ一覧が返る', () => {
   const { context } = loadGasScript();
   const result = callDoGetCategories(context);
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.categories.length, 10);
   assert.ok(result.categories.indexOf('PC系') !== -1);
+  assert.deepStrictEqual(Array.from(result.tags), [], 'タグは最初は空（設定画面から追加していく運用）');
   assert.match(result.rootFolderUrl, /^https:\/\/drive\.google\.com\/drive\/folders\//);
 });
 
@@ -688,8 +585,8 @@ test('addCategory: 名前に / や \\ が含まれる場合は・に置換され
   assert.ok(result.categories.indexOf('A・B・C') !== -1);
 });
 
-test('removeCategory: 削除すると一覧から消えるが、既存のDriveファイル・Sheets行は残る', () => {
-  const { context, rootFolder } = loadGasScript();
+test('removeCategory: 削除すると一覧から消えるが、既存のSheets行は残る', () => {
+  const { context, sheet } = loadGasScript();
   callDoPost(context, { url: 'https://example.com/old', category: 'PC系', memo: '削除前に保存' });
 
   const removed = callDoPost(context, { action: 'removeCategory', name: 'PC系' });
@@ -700,11 +597,8 @@ test('removeCategory: 削除すると一覧から消えるが、既存のDrive�
   const saveAfterRemove = callDoPost(context, { url: 'https://example.com/new', category: 'PC系' });
   assert.strictEqual(saveAfterRemove.ok, false);
 
-  // 削除前に保存したDrive上のファイルは残っている（非破壊）
-  const knowledge = rootFolder.subFolders.find((f) => f.name === 'ナレッジ');
-  const pcFolder = knowledge.subFolders.find((f) => f.name === 'PC系');
-  assert.ok(pcFolder, 'カテゴリフォルダ自体は削除されない');
-  assert.strictEqual(pcFolder.files.length, 1, '保存済みファイルは残る');
+  // 削除前に保存した行は残っている（非破壊）
+  assert.strictEqual(sheet._rows.length, 2, 'ヘッダ + 削除前の1行は残る');
 });
 
 test('removeCategory: 存在しないカテゴリの削除はエラー', () => {
@@ -734,6 +628,180 @@ test('DEFAULT_CATEGORIES: 元の10カテゴリがそのまま定義されてい�
     '業務マニュアル', '自由掲示板', 'PC系', 'DTP系', 'その他PC学習、スキル',
     'PCニュース', '語学系', '英語・中国語', 'レシピ、お店', 'TOCO/お知らせ'
   ]);
+});
+
+// ---- タグ管理（動的CRUD。カテゴリと同じ方式だが初期値は空配列） ----------
+
+test('getTags_: 初回アクセスでは空配列を返す（カテゴリと違い初期候補は無い）', () => {
+  const { context } = loadGasScript();
+  assert.deepStrictEqual(Array.from(context.getTags_()), []);
+});
+
+test('addTag: 新しいタグを追加すると一覧に反映され、以後 save でも使える', () => {
+  const { context, sheet } = loadGasScript();
+  const added = callDoPost(context, { action: 'addTag', name: '要対応' });
+  assert.strictEqual(added.ok, true);
+  assert.deepStrictEqual(Array.from(added.tags), ['要対応']);
+
+  const saved = callDoPost(context, {
+    url: 'https://example.com/x', category: 'PC系', tags: ['要対応']
+  });
+  assert.strictEqual(saved.ok, true, '追加した直後のタグで保存できる');
+  assert.strictEqual(sheet._rows[1][6], '要対応', 'タグ列に反映される');
+});
+
+test('addTag: 空名は拒否される', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'addTag', name: '   ' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /タグ名が指定されていません/);
+});
+
+test('addTag: 同名タグの重複追加は拒否される', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: '要対応' });
+  const result = callDoPost(context, { action: 'addTag', name: '要対応' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /同名のタグが既にあります/);
+});
+
+test('addTag: 名前にカンマが含まれる場合は読点に置換される（タグ列のカンマ区切り対策）', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'addTag', name: 'A,B' });
+  assert.strictEqual(result.ok, true);
+  assert.ok(result.tags.indexOf('A、B') !== -1);
+});
+
+test('removeTag: 削除すると一覧から消えるが、既存のSheets行のタグ文字列は変わらない', () => {
+  const { context, sheet } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: '要対応' });
+  callDoPost(context, { url: 'https://example.com/x', category: 'PC系', tags: ['要対応'] });
+
+  const removed = callDoPost(context, { action: 'removeTag', name: '要対応' });
+  assert.strictEqual(removed.ok, true);
+  assert.strictEqual(removed.tags.indexOf('要対応'), -1);
+
+  // 新規保存でこのタグはもう使えない
+  const saveAfterRemove = callDoPost(context, {
+    url: 'https://example.com/y', category: 'PC系', tags: ['要対応']
+  });
+  assert.strictEqual(saveAfterRemove.ok, false);
+  assert.match(saveAfterRemove.error, /不明なタグです/);
+
+  // 削除前に保存した行のタグ列はそのまま
+  assert.strictEqual(sheet._rows[1][6], '要対応');
+});
+
+test('removeTag: 存在しないタグの削除はエラー', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, { action: 'removeTag', name: '存在しないタグ' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /存在しないタグです/);
+});
+
+test('reorderTags: 並び替えた順序が保存され、以後の categories API に反映される', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'A' });
+  callDoPost(context, { action: 'addTag', name: 'B' });
+  callDoPost(context, { action: 'addTag', name: 'C' });
+
+  const result = callDoPost(context, { action: 'reorderTags', tags: ['C', 'A', 'B'] });
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.tags, ['C', 'A', 'B']);
+  assert.deepStrictEqual(callDoGetCategories(context).tags, ['C', 'A', 'B']);
+});
+
+test('reorderTags: 件数や中身が一致しない並び替えは拒否される', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'A' });
+  callDoPost(context, { action: 'addTag', name: 'B' });
+
+  const missingOne = callDoPost(context, { action: 'reorderTags', tags: ['A'] });
+  assert.strictEqual(missingOne.ok, false);
+
+  const renamed = callDoPost(context, { action: 'reorderTags', tags: ['A', '違う名前'] });
+  assert.strictEqual(renamed.ok, false);
+
+  assert.deepStrictEqual(callDoGetCategories(context).tags, ['A', 'B']);
+});
+
+test('reorderTags: tags が配列でない・無い場合はエラー', () => {
+  const { context } = loadGasScript();
+  const r1 = callDoPost(context, { action: 'reorderTags' });
+  assert.strictEqual(r1.ok, false);
+  const r2 = callDoPost(context, { action: 'reorderTags', tags: 'A' });
+  assert.strictEqual(r2.ok, false);
+});
+
+test('doPost: addTag/removeTag/reorderTagsもSHARED_TOKEN検証の対象になる', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const result = callDoPost(context, { action: 'addTag', name: 'A', token: 'wrong' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('save: 複数タグを選択して保存すると、Sheetsのタグ列に ", " 区切りでまとめられる', () => {
+  const { context, sheet } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  callDoPost(context, { action: 'addTag', name: 'タグB' });
+
+  const result = callDoPost(context, {
+    url: 'https://example.com/multi', category: 'PC系', tags: ['タグA', 'タグB']
+  });
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(Array.from(result.tags), ['タグA', 'タグB']);
+  assert.strictEqual(sheet._rows[1][6], 'タグA, タグB');
+});
+
+test('save: タグ未指定・空配列でも保存できる（任意項目）', () => {
+  const { context, sheet } = loadGasScript();
+  const result = callDoPost(context, { url: 'https://example.com/notag', category: 'PC系' });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(sheet._rows[1][6], '');
+});
+
+test('save: 現在のタグ一覧に無いタグを指定するとエラーになる', () => {
+  const { context } = loadGasScript();
+  const result = callDoPost(context, {
+    url: 'https://example.com/x', category: 'PC系', tags: ['存在しないタグ']
+  });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /不明なタグです/);
+});
+
+test('normalizeTagsInput_: 配列以外は空配列に、前後空白・空文字は除去される', () => {
+  const { context } = loadGasScript();
+  // vm(別レルム)の配列と比較するため、prototypeを問わない Array.from で正規化してから比較する
+  assert.deepStrictEqual(Array.from(context.normalizeTagsInput_(undefined)), []);
+  assert.deepStrictEqual(Array.from(context.normalizeTagsInput_('タグA')), []);
+  assert.deepStrictEqual(
+    Array.from(context.normalizeTagsInput_(['  タグA  ', '', 'タグB'])), ['タグA', 'タグB']
+  );
+});
+
+// ---- コンテナバインド化（getOrCreateIndexSheet_） -----------------------
+
+test('コンテナバインド: getActiveSpreadsheetの最初のシートを使い、空なら見出し行を書き込む', () => {
+  const { context, sheet } = loadGasScript();
+  const returned = context.getOrCreateIndexSheet_();
+  assert.strictEqual(returned, sheet, 'アクティブなスプレッドシートの1枚目のシートを返す');
+  assert.deepStrictEqual(
+    Array.from(sheet._rows[0]),
+    ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル', 'タグ']
+  );
+});
+
+test('コンテナバインド: 列追加前から運用しているシート（タグ列ヘッダー無し）はヘッダーだけ補完する', () => {
+  const { context, sheet } = loadGasScript();
+  // 移行前の6列ヘッダーを直接書き込んでおく（タグ列は存在しない状態を再現）
+  sheet.appendRow(['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
+  sheet.appendRow(['2026-07-01 10:00', 'PC系', '既存記事', 'https://example.com/old', '', '']);
+
+  context.getOrCreateIndexSheet_();
+
+  assert.strictEqual(sheet._rows[0][6], 'タグ', 'G1にヘッダーが補完される');
+  assert.strictEqual(sheet._rows.length, 2, '既存データ行は変更されない');
+  assert.strictEqual(sheet._rows[1][2], '既存記事', '既存データ行は変更されない');
 });
 
 // ---- URL解決（短縮/リダイレクトリンク対策） -----------------------
@@ -798,8 +866,8 @@ test('resolveRelativeUrl_: /始まりの相対パスはoriginと結合する', (
   );
 });
 
-test('doPost: 短縮/リダイレクトURLは実URLに解決されてからDrive・Sheetsに保存される', () => {
-  const { context, rootFolder, spreadsheetsById } = loadGasScript({
+test('doPost: 短縮/リダイレクトURLは実URLに解決されてからSheetsに保存される', () => {
+  const { context, sheet } = loadGasScript({
     fetchImpl: (url) => {
       if (url === 'https://short.example/abc') {
         return makeFetchResponse({ code: 302, headers: { Location: 'https://real.example/article' } });
@@ -811,60 +879,7 @@ test('doPost: 短縮/リダイレクトURLは実URLに解決されてからDrive
   const result = callDoPost(context, { url: 'https://short.example/abc', category: 'PC系' });
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.title, '実記事タイトル');
-
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.match(file.content, /- URL: https:\/\/real\.example\/article/);
-  assert.match(file.content, /共有時のURL（短縮\/リダイレクト元）: https:\/\/short\.example\/abc/);
-
-  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
-  assert.strictEqual(rows[1][3], 'https://real.example/article', 'Sheets側のURL列も解決後のURL');
-});
-
-test('doPost: リダイレクトが無いURLでは「共有時のURL」行を出さない', () => {
-  const { context, rootFolder } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>直リンク記事</title>' })
-  });
-  callDoPost(context, { url: 'https://example.com/direct', category: 'PC系' });
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.doesNotMatch(file.content, /共有時のURL/);
-});
-
-// ---- 本文自動抽出 -----------------------------------------------
-
-test('extractBodyText_: script/styleを除去し、タグを剥がしてテキスト化する', () => {
-  const { context } = loadGasScript();
-  const html = '<html><head><style>.a{color:red}</style><script>alert(1)</script></head>' +
-    '<body><h1>見出し</h1><p>本文1行目です。</p><p>本文2行目です。</p></body></html>';
-  const text = context.extractBodyText_(html);
-  assert.doesNotMatch(text, /alert\(1\)/);
-  assert.doesNotMatch(text, /color:red/);
-  assert.match(text, /見出し/);
-  assert.match(text, /本文1行目です。/);
-  assert.match(text, /本文2行目です。/);
-});
-
-test('extractBodyText_: 長すぎる本文はBODY_TEXT_MAXで切り詰められる', () => {
-  const { context } = loadGasScript();
-  const html = '<p>' + 'あ'.repeat(6000) + '</p>';
-  const text = context.extractBodyText_(html);
-  assert.ok(text.length < 4100, '切り詰められている: ' + text.length);
-  assert.match(text, /…（以下省略）$/);
-});
-
-test('extractBodyText_: 空HTMLは空文字を返す', () => {
-  const { context } = loadGasScript();
-  assert.strictEqual(context.extractBodyText_(''), '');
-});
-
-test('doPost: 抽出した本文がMarkdownの「本文」節に反映される', () => {
-  const { context, rootFolder } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>本文付き記事</title><p>これは本文です。</p>' })
-  });
-  const result = callDoPost(context, { url: 'https://example.com/body-test', category: 'PC系' });
-  assert.strictEqual(result.ok, true);
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.match(file.content, /## 本文（自動抽出・参考）/);
-  assert.match(file.content, /これは本文です。/);
+  assert.strictEqual(sheet._rows[1][3], 'https://real.example/article', 'Sheets側のURL列は解決後のURL');
 });
 
 // ---- メモ重複排除（タイトルと同一のメモを捨てる） -------------------
@@ -889,66 +904,24 @@ test('isDuplicateMemo_: 空メモは重複ではない', () => {
   assert.strictEqual(context.isDuplicateMemo_('', 'タイトル'), false);
 });
 
-test('doPost: メモがタイトルと同一なら「メモ」節を出さない（重複防止）', () => {
-  const { context, rootFolder } = loadGasScript({
+test('doPost: メモがタイトルと同一なら、Sheetsのメモ列は空になる（重複防止）', () => {
+  const { context, sheet } = loadGasScript({
     fetchImpl: () => makeFetchResponse({ body: '<title>同じ内容</title>' })
   });
   const result = callDoPost(context, { url: 'https://example.com/dup', category: 'PC系', memo: '同じ内容' });
   assert.strictEqual(result.ok, true);
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.doesNotMatch(file.content, /## メモ/);
+  assert.strictEqual(sheet._rows[1][4], '');
 });
 
-test('doPost: メモがタイトルと異なれば通常通り「メモ」節を出す', () => {
-  const { context, rootFolder } = loadGasScript({
+test('doPost: メモがタイトルと異なれば、Sheetsのメモ列にそのまま入る', () => {
+  const { context, sheet } = loadGasScript({
     fetchImpl: () => makeFetchResponse({ body: '<title>タイトル</title>' })
   });
   callDoPost(context, { url: 'https://example.com/diff', category: 'PC系', memo: '別のコメント' });
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.match(file.content, /## メモ\n\n別のコメント/);
+  assert.strictEqual(sheet._rows[1][4], '別のコメント');
 });
 
-// ---- Google Docs形式での保存 --------------------------------------
-// プレーンテキスト/Markdown（text/markdown）はクラウド版Claudeの Google Drive
-// 連携が直接読めるMIMEタイプに含まれないため、Google Docsネイティブ形式で保存する。
-
-test('doPost: 記事はGoogleドキュメント（DocumentApp）として作成される', () => {
-  const { context, rootFolder } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>Docs形式テスト</title><p>本文</p>' })
-  });
-  const result = callDoPost(context, { url: 'https://example.com/docs-test', category: 'PC系' });
-  assert.strictEqual(result.ok, true);
-
-  const file = rootFolder.subFolders[0].subFolders[0].files[0];
-  assert.strictEqual(file._isDoc, true, 'createFileではなくDocumentApp.createで作られている');
-  assert.strictEqual(file.mimeType, 'application/vnd.google-apps.document');
-  assert.match(file.getUrl(), /^https:\/\/docs\.google\.com\/document\/d\//);
-});
-
-test('doPost: Sheetsインデックスの「Driveファイル」列にドキュメントへのHYPERLINKが入る', () => {
-  const { context, spreadsheetsById } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>索引にファイルリンク</title>' })
-  });
-  callDoPost(context, { url: 'https://example.com/index-file-link', category: 'PC系' });
-
-  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
-  assert.deepStrictEqual(Array.from(rows[0]), ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル']);
-  assert.strictEqual(rows[1][5], '開く', 'Driveファイル列はHYPERLINKの表示値「開く」になる');
-});
-
-test('doPost: 同名記事の重複判定はGoogleドキュメントに対しても機能する（上書き防止）', () => {
-  const { context, rootFolder } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>重複タイトル</title>' })
-  });
-  callDoPost(context, { url: 'https://example.com/dup-a', category: 'PC系' });
-  callDoPost(context, { url: 'https://example.com/dup-b', category: 'PC系' });
-
-  const files = rootFolder.subFolders[0].subFolders[0].files;
-  assert.strictEqual(files.length, 2, '2件ともドキュメントとして保存される');
-  assert.notStrictEqual(files[0].name, files[1].name, 'ファイル名（ドキュメントのタイトル）が衝突しない');
-});
-
-// ---- GET系APIの合言葉検証（レビュー指摘🔴1の回帰テスト） -----------
+// ---- GET系APIの合言葉検証 -----------------------------------------
 // 記事一覧はタイトル・URL・メモといった個人の閲覧記録に近い情報を含むため、
 // WebアプリのURLを知られただけでは読めないよう、GETもPOSTと同じ合言葉で保護する。
 
@@ -991,7 +964,7 @@ test('GET保護: tokenなしでも稼働確認メッセージ(actionなし)は�
   assert.strictEqual(result.ok, true, '稼働確認は情報を含まないため合言葉不要');
 });
 
-// ---- Sheets数式インジェクション対策（レビュー指摘🔴4の回帰テスト） ---
+// ---- Sheets数式インジェクション対策 ---------------------------------
 
 test('sanitizeCellText_: 先頭が = の文字列にはアポストロフィが付く', () => {
   const { context } = loadGasScript();
@@ -1006,46 +979,11 @@ test('sanitizeCellText_: 通常の文字列はそのまま', () => {
 });
 
 test('doPost: メモが数式で始まる場合、Sheetsにはアポストロフィ付きで書き込まれる', () => {
-  const { context, spreadsheetsById } = loadGasScript({
+  const { context, sheet } = loadGasScript({
     fetchImpl: () => makeFetchResponse({ body: '<title>数式入りメモの記事</title>' })
   });
   callDoPost(context, { url: 'https://example.com/f', category: 'PC系', memo: '=1+1' });
-
-  const rows = Object.values(spreadsheetsById)[0]._sheet._rows;
-  assert.strictEqual(rows[1][4], "'=1+1", 'メモ列は数式として解釈されない形で格納される');
-});
-
-// ---- 本文抽出の改善（レビュー指摘🟡6の回帰テスト） ------------------
-
-test('extractBodyText_: nav/header/footer/aside内のテキストは除去される', () => {
-  const { context } = loadGasScript();
-  const html = '<body><nav>メニュー ランキング</nav><header>サイトヘッダー</header>' +
-    '<p>これが本文です。</p><aside>広告です</aside><footer>フッター情報</footer></body>';
-  const text = context.extractBodyText_(html);
-  assert.doesNotMatch(text, /メニュー ランキング/);
-  assert.doesNotMatch(text, /サイトヘッダー/);
-  assert.doesNotMatch(text, /広告です/);
-  assert.doesNotMatch(text, /フッター情報/);
-  assert.match(text, /これが本文です。/);
-});
-
-test('extractBodyText_: <article>があればその中身だけが本文になる', () => {
-  const { context } = loadGasScript();
-  const html = '<body><div>サイドバーのおすすめ記事一覧</div>' +
-    '<article><h1>記事見出し</h1><p>記事の本文段落。</p></article>' +
-    '<div>関連記事リスト</div></body>';
-  const text = context.extractBodyText_(html);
-  assert.match(text, /記事見出し/);
-  assert.match(text, /記事の本文段落。/);
-  assert.doesNotMatch(text, /サイドバーのおすすめ記事一覧/);
-  assert.doesNotMatch(text, /関連記事リスト/);
-});
-
-test('extractBodyText_: articleが無ければページ全体からの抽出にフォールバックする', () => {
-  const { context } = loadGasScript();
-  const html = '<body><div><p>タグ構造が古いサイトの本文。</p></div></body>';
-  const text = context.extractBodyText_(html);
-  assert.match(text, /タグ構造が古いサイトの本文。/);
+  assert.strictEqual(sheet._rows[1][4], "'=1+1", 'メモ列は数式として解釈されない形で格納される');
 });
 
 // ---- コード品質の回帰チェック（レビュー指摘🔴3） ---------------------
@@ -1189,7 +1127,7 @@ test('ルートフォルダ: 一度アクセスするとIDがスクリプトプ�
 
 test('ルートフォルダ: 記憶されたIDのフォルダが消えていても名前検索にフォールバックして復旧する', () => {
   const { context, rootFolder } = loadGasScript({
-    scriptProperties: { ROOT_FOLDER_ID: 'folder-존재しないID' }
+    scriptProperties: { ROOT_FOLDER_ID: 'folder-存在しないID' }
   });
   const result = callDoGetCategories(context);
   assert.strictEqual(result.ok, true, '古いIDが無効でもエラーにならない');
@@ -1214,7 +1152,9 @@ test('ルートフォルダ: IDキャッシュ利用時もフォルダが二重�
   assert.strictEqual(knowledgeFolders.length, 1, '「ナレッジ」フォルダは1つだけ');
 });
 
-// ---- 記事の編集（action=update）とその補助関数 ------------------------
+// ---- 保存済み記事（過去のGoogleドキュメント）の編集（action=update） --------
+// 現在の save はもうGoogleドキュメントを作らないため、editテストは
+// seedLegacyArticle() で「移行前に保存された記事」を直接作り込んでから検証する。
 
 test('fileId抽出: Driveファイル列のHYPERLINK数式からfileIdを取り出せる', () => {
   const { context } = loadGasScript();
@@ -1282,15 +1222,14 @@ test('Doc再構築: タイトル・URL・メモを差し替えつつ、共有時
   assert.doesNotMatch(rebuilt, /旧タイトル|旧メモ/, '旧の編集対象値が残らないこと');
 });
 
-test('編集API正常系: 一覧のfileIdで更新でき、Sheets行とDoc本文の両方に反映される', () => {
-  const { context, spreadsheetsById } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' })
+test('編集API正常系: legacyな記事のfileIdで更新でき、Sheets行とDoc本文の両方に反映される', () => {
+  const { context, sheet } = loadGasScript();
+  const { fileId } = seedLegacyArticle(context, {
+    savedAt: '2026-07-01 10:00', category: 'PC系', title: '元のタイトル', url: 'https://example.com/old', memo: '元メモ'
   });
-  callDoPost(context, { url: 'https://example.com/old', category: 'PC系', memo: '元メモ' });
 
   const listed = callDoGetList(context, 'PC系');
-  const fileId = listed.items[0].fileId;
-  assert.ok(fileId, '一覧APIが編集キーのfileIdを返すこと');
+  assert.strictEqual(listed.items[0].fileId, fileId, '一覧APIが編集キーのfileIdを返すこと');
 
   const result = callDoPost(context, {
     action: 'update', fileId: fileId,
@@ -1306,7 +1245,6 @@ test('編集API正常系: 一覧のfileIdで更新でき、Sheets行とDoc本文
   assert.strictEqual(after.items[0].fileId, fileId, 'fileIdは変わらないこと');
 
   // 別レイヤー確認2: Sheetsのタイトル列はHYPERLINK数式のまま新URLを指す
-  const sheet = Object.values(spreadsheetsById)[0]._sheet;
   assert.strictEqual(
     sheet._formulas[1][2],
     '=HYPERLINK("https://example.com/new","新タイトル")'
@@ -1321,11 +1259,10 @@ test('編集API正常系: 一覧のfileIdで更新でき、Sheets行とDoc本文
 });
 
 test('編集API異常系: fileId無し・未知のfileId・タイトル空・URL形式不正はエラーになる', () => {
-  const { context } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' })
+  const { context } = loadGasScript();
+  const { fileId } = seedLegacyArticle(context, {
+    savedAt: '2026-07-01 10:00', category: 'PC系', title: '元のタイトル', url: 'https://example.com/old'
   });
-  callDoPost(context, { url: 'https://example.com/old', category: 'PC系' });
-  const fileId = callDoGetList(context, 'PC系').items[0].fileId;
 
   const cases = [
     [{ action: 'update', title: 't', url: 'https://a.example/' }, '編集対象が指定されていません'],
@@ -1342,11 +1279,11 @@ test('編集API異常系: fileId無し・未知のfileId・タイトル空・URL
 
 test('編集API認可: SHARED_TOKEN設定時、合言葉が違うupdateは拒否される', () => {
   const { context } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' }),
     scriptProperties: { SHARED_TOKEN: 'aikotoba' }
   });
-  callDoPost(context, { url: 'https://example.com/old', category: 'PC系', token: 'aikotoba' });
-  const fileId = callDoGetList(context, 'PC系', 'aikotoba').items[0].fileId;
+  const { fileId } = seedLegacyArticle(context, {
+    savedAt: '2026-07-01 10:00', category: 'PC系', title: '元のタイトル', url: 'https://example.com/old'
+  });
 
   const denied = callDoPost(context, {
     action: 'update', fileId: fileId, title: '改ざん', url: 'https://evil.example/', token: 'ちがう'
@@ -1361,11 +1298,10 @@ test('編集API認可: SHARED_TOKEN設定時、合言葉が違うupdateは拒否
 });
 
 test('編集API防御: メモの数式インジェクションはサニタイズされ、タイトルの引用符は数式内でエスケープされる', () => {
-  const { context, spreadsheetsById } = loadGasScript({
-    fetchImpl: () => makeFetchResponse({ body: '<title>元のタイトル</title>' })
+  const { context, sheet } = loadGasScript();
+  const { fileId } = seedLegacyArticle(context, {
+    savedAt: '2026-07-01 10:00', category: 'PC系', title: '元のタイトル', url: 'https://example.com/old'
   });
-  callDoPost(context, { url: 'https://example.com/old', category: 'PC系' });
-  const fileId = callDoGetList(context, 'PC系').items[0].fileId;
 
   const result = callDoPost(context, {
     action: 'update', fileId: fileId,
@@ -1373,7 +1309,6 @@ test('編集API防御: メモの数式インジェクションはサニタイズ
   });
   assert.strictEqual(result.ok, true);
 
-  const sheet = Object.values(spreadsheetsById)[0]._sheet;
   assert.strictEqual(
     sheet._rows[1][4], "'=IMPORTXML(\"https://evil.example/\",\"//a\")",
     'メモ先頭の = はアポストロフィで無害化されること'
@@ -1389,7 +1324,14 @@ test('編集API防御: メモの数式インジェクションはサニタイズ
 
 test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（重複定義の再発防止）', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'gas', 'Code.gs'), 'utf8');
-  for (const fn of ['handleReorderCategories_', 'getOrCreateRootFolder_', 'handleList_', 'getOrCreateIndexSheet_', 'appendIndexRow_', 'doGet', 'doPost', 'handleUpdate_', 'extractFileIdFromFormula_', 'rebuildDocContent_', 'extractDocOriginalUrl_', 'extractDocBodyText_']) {
+  const names = [
+    'handleReorderCategories_', 'getOrCreateRootFolder_', 'handleList_', 'getOrCreateIndexSheet_',
+    'appendIndexRow_', 'doGet', 'doPost', 'handleUpdate_', 'extractFileIdFromFormula_',
+    'rebuildDocContent_', 'extractDocOriginalUrl_', 'extractDocBodyText_',
+    'getTags_', 'saveTags_', 'sanitizeTagName_', 'normalizeTagsInput_',
+    'handleAddTag_', 'handleRemoveTag_', 'handleReorderTags_', 'fetchPageTitle_'
+  ];
+  for (const fn of names) {
     const definitions = source.match(new RegExp('function ' + fn + '\\(', 'g')) || [];
     assert.strictEqual(definitions.length, 1, fn + ' の定義がちょうど1つであること');
   }

@@ -2,10 +2,14 @@
 // ナレッジ保存 バックエンド (Google Apps Script Webアプリ)
 //
 //   PWA(共有シート)から URL とカテゴリ名を POST で受け取り、
-//   ページタイトルを自動取得して Google Drive の
-//   「ナレッジ/<カテゴリ名>/」フォルダに Markdown で保存する。
+//   ページタイトルを自動取得して検索用インデックス（Sheets）に記録する。
 //
-//   デプロイ方法: GASエディタに貼り付け →「デプロイ」→「ウェブアプリ」
+//   このスクリプトは検索用インデックス・スプレッドシート「ナレッジ一覧」に
+//   コンテナバインドされている前提（SpreadsheetApp.getActiveSpreadsheet()で
+//   そのスプレッドシート自身を参照する）。
+//
+//   デプロイ方法: バインド先スプレッドシートの「拡張機能」→「Apps Script」→
+//     「デプロイ」→「ウェブアプリ」
 //     - 次のユーザーとして実行: 自分
 //     - アクセスできるユーザー: 全員
 //   ※「全員」で公開するため、スクリプトプロパティ SHARED_TOKEN に
@@ -14,12 +18,17 @@
 
 // ---- 定数 --------------------------------------------------
 
-// Drive 上のルートフォルダ名（この直下にカテゴリ別フォルダを作る）
+// Drive 上のルートフォルダ名（過去に保存したGoogleドキュメントの置き場。
+// 新規記事はここには保存しないが、Driveショートカットボタンの参照先として使う）
 var ROOT_FOLDER_NAME = 'ナレッジ';
 
 // カテゴリ一覧を保存するスクリプトプロパティのキー
 // （PWAから追加・削除できるようにするため、固定配列ではなくプロパティで管理する）
 var CATEGORIES_PROPERTY = 'CATEGORIES_JSON';
+
+// タグ一覧を保存するスクリプトプロパティのキー（カテゴリとは別軸の項目）
+// 初期値は空配列。設定画面から追加していく運用とする
+var TAGS_PROPERTY = 'TAGS_JSON';
 
 // ルートフォルダ「ナレッジ」のIDを保存するスクリプトプロパティのキー
 // （毎回マイドライブ全体から名前検索すると数百ms〜数秒かかるため、
@@ -41,17 +50,16 @@ var DEFAULT_CATEGORIES = [
   'TOCO/お知らせ'
 ];
 
-// ファイル名に使うタイトルの最大文字数（長すぎると一覧で読みにくいため）
-var FILENAME_TITLE_MAX = 60;
-
-// タイムゾーン（保存日時・ファイル名の日付に使用）
+// タイムゾーン（保存日時に使用）
 var TIME_ZONE = 'Asia/Tokyo';
 
 // 検索用インデックス（Googleスプレッドシート）関連の定数
-var INDEX_SHEET_ID_PROPERTY = 'INDEX_SHEET_ID'; // スクリプトプロパティに保存するID
+// このスクリプトは「ナレッジ一覧」スプレッドシートにコンテナバインドされている前提のため、
+// スプレッドシートIDをスクリプトプロパティに保持する必要はなく、
+// SpreadsheetApp.getActiveSpreadsheet() で自分自身（バインド先）を直接参照する。
 var INDEX_SHEET_NAME = 'ナレッジ一覧';
-var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル'];
-var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5, FILE: 6 };
+var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル', 'タグ'];
+var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5, FILE: 6, TAGS: 7 };
 
 // 一覧APIで一度に返す件数（1ページ分）。
 // 件数が増えてもレスポンスが重くならないよう50件で区切り、
@@ -85,8 +93,8 @@ function doGet(e) {
 }
 
 /**
- * カテゴリ一覧と、Driveの「ナレッジ」フォルダを直接開くためのURLを返す。
- * PWAの起動時・設定画面・一覧画面でカテゴリボタンを動的に描画するために使う。
+ * カテゴリ一覧・タグ一覧と、Driveの「ナレッジ」フォルダを直接開くためのURLを返す。
+ * PWAの起動時・設定画面・一覧画面でカテゴリ/タグボタンを動的に描画するために使う。
  */
 function handleCategories_(token) {
   try {
@@ -94,6 +102,7 @@ function handleCategories_(token) {
     return jsonResponse_({
       ok: true,
       categories: getCategories_(),
+      tags: getTags_(),
       rootFolderUrl: getOrCreateRootFolder_().getUrl()
     });
   } catch (err) {
@@ -173,6 +182,9 @@ function handleList_(category, token, offsetParam) {
  *   - removeCategory   : { name } をカテゴリ一覧から削除（保存済みデータは残す）
  *   - reorderCategories: { categories } の順にカテゴリの並び順を変更
  *   - update           : { fileId, title, url, memo? } 保存済み記事の内容を編集
+ *   - addTag           : { name } をタグ一覧に追加
+ *   - removeTag        : { name } をタグ一覧から削除（保存済みデータは残す）
+ *   - reorderTags      : { tags } の順にタグの並び順を変更
  * すべての action 共通で token（合言葉）を検証する。
  */
 function doPost(e) {
@@ -192,6 +204,12 @@ function doPost(e) {
         return jsonResponse_(handleReorderCategories_(body));
       case 'update':
         return jsonResponse_(handleUpdate_(body));
+      case 'addTag':
+        return jsonResponse_(handleAddTag_(body));
+      case 'removeTag':
+        return jsonResponse_(handleRemoveTag_(body));
+      case 'reorderTags':
+        return jsonResponse_(handleReorderTags_(body));
       default:
         throw new Error('不明なactionです: ' + action);
     }
@@ -222,6 +240,7 @@ function parseJsonBody_(e) {
 
 /**
  * 記事保存(action=save)のリクエストを検証し、保存処理を実行する。
+ * 保存先は検索用インデックス（Sheets）のみ（Googleドキュメントへの転記は行わない）。
  */
 function handleSave_(body) {
   var params = validateSaveParams_(body);
@@ -231,39 +250,19 @@ function handleSave_(body) {
   //   後で人間やAIが開く際に不便な上、短縮リンクは将来失効するリスクもあるため）
   var resolvedUrl = resolveFinalUrl_(params.url);
 
-  // ステップ2: ページのタイトルと本文テキストを取得（失敗時はタイトル=URL、本文=空）
-  var details = fetchPageDetails_(resolvedUrl);
+  // ステップ2: ページのタイトルを取得（失敗時はタイトル=URL）
+  var title = fetchPageTitle_(resolvedUrl);
 
   // ステップ3: メモがタイトルと重複している場合は捨てる
   // （Android共有時に「タイトル文字列」がそのままメモ扱いで送られてくることが多く、
-  //   タイトルと同じ内容が本文中に二重表示されるのを防ぐ）
-  var memo = isDuplicateMemo_(params.memo, details.title) ? '' : params.memo;
+  //   タイトルと同じ内容が二重表示されるのを防ぐ）
+  var memo = isDuplicateMemo_(params.memo, title) ? '' : params.memo;
 
-  // ステップ4: Drive のカテゴリフォルダへ Googleドキュメントとして保存
-  // （プレーンテキスト/Markdownファイルは、クラウド版Claudeの Google Drive
-  //   連携（自然言語での自動読み込み）が直接サポートするMIMEタイプに含まれておらず、
-  //   確実に内容を読ませるには Google Docs 形式にする必要があるため）
-  var saved = saveToDrive_(
-    params.category, resolvedUrl, details.title, memo, details.bodyText, params.url
-  );
+  // ステップ4: 検索用インデックス（Sheets）に1行追記する
+  var savedAt = Utilities.formatDate(new Date(), TIME_ZONE, 'yyyy-MM-dd HH:mm');
+  appendIndexRow_(savedAt, params.category, title, resolvedUrl, memo, params.tags);
 
-  // ステップ5: 検索用インデックス（Sheets）に1行追記する
-  // インデックスへの追記に失敗しても、Doc本体の保存は成功しているため
-  // ユーザーには成功として返す（インデックスは検索補助であり本体ではない）
-  try {
-    appendIndexRow_(
-      saved.savedAt, params.category, details.title, resolvedUrl, memo, saved.fileUrl
-    );
-  } catch (indexErr) {
-    console.error('インデックスへの追記に失敗しました: ' + indexErr);
-  }
-
-  return {
-    ok: true,
-    title: details.title,
-    fileName: saved.fileName,
-    folderPath: ROOT_FOLDER_NAME + '/' + params.category
-  };
+  return { ok: true, title: title, category: params.category, tags: params.tags };
 }
 
 /**
@@ -273,6 +272,7 @@ function validateSaveParams_(body) {
   var url = String(body.url || '').trim();
   var category = String(body.category || '').trim();
   var memo = String(body.memo || '').trim();
+  var tags = normalizeTagsInput_(body.tags);
 
   // URL の検証: http/https のみ許可（javascript: 等の混入を防ぐ）
   if (!url) {
@@ -283,7 +283,6 @@ function validateSaveParams_(body) {
   }
 
   // カテゴリの検証: 現在のカテゴリ一覧に完全一致するもののみ受け付ける
-  // （フォルダ名として使うため、任意文字列を通すとパス汚染の恐れがある）
   if (!category) {
     throw new Error('カテゴリが指定されていません');
   }
@@ -291,7 +290,28 @@ function validateSaveParams_(body) {
     throw new Error('不明なカテゴリです: ' + category);
   }
 
-  return { url: url, category: category, memo: memo };
+  // タグの検証: 現在のタグ一覧に完全一致するもののみ受け付ける（任意項目のため0件でも可）
+  var knownTags = getTags_();
+  tags.forEach(function (tag) {
+    if (knownTags.indexOf(tag) === -1) {
+      throw new Error('不明なタグです: ' + tag);
+    }
+  });
+
+  return { url: url, category: category, memo: memo, tags: tags };
+}
+
+/**
+ * リクエストの tags（配列であるべき）を、前後空白除去済み・空文字除外済みの
+ * 文字列配列に正規化する純粋関数。配列でない場合は空配列を返す。
+ */
+function normalizeTagsInput_(raw) {
+  if (Object.prototype.toString.call(raw) !== '[object Array]') {
+    return [];
+  }
+  return raw
+    .map(function (tag) { return String(tag || '').trim(); })
+    .filter(function (tag) { return !!tag; });
 }
 
 /**
@@ -367,6 +387,74 @@ function sanitizeCategoryName_(name) {
 }
 
 /**
+ * タグを1件追加する(action=addTag)。同名が既にあればエラー。
+ */
+function handleAddTag_(body) {
+  var name = sanitizeTagName_(body.name);
+  if (!name) {
+    throw new Error('タグ名が指定されていません');
+  }
+
+  var tags = getTags_();
+  if (tags.indexOf(name) !== -1) {
+    throw new Error('同名のタグが既にあります: ' + name);
+  }
+
+  tags.push(name);
+  saveTags_(tags);
+  return { ok: true, tags: tags };
+}
+
+/**
+ * タグを1件削除する(action=removeTag)。
+ * タグ一覧（選択肢）から外すだけで、Sheetsの過去の行に書き込まれたタグ文字列は変更しない。
+ */
+function handleRemoveTag_(body) {
+  var name = String(body.name || '').trim();
+  var tags = getTags_();
+  var index = tags.indexOf(name);
+  if (index === -1) {
+    throw new Error('存在しないタグです: ' + name);
+  }
+
+  tags.splice(index, 1);
+  saveTags_(tags);
+  return { ok: true, tags: tags };
+}
+
+/**
+ * タグの並び順を変更する(action=reorderTags)。
+ * body.tags（新しい並び順の配列）が「現在のタグ一覧の並び替え」になっていることを
+ * 検証してから保存する（カテゴリのreorderCategoriesと同じ方針）。
+ */
+function handleReorderTags_(body) {
+  var requested = body.tags;
+  if (Object.prototype.toString.call(requested) !== '[object Array]') {
+    throw new Error('並び替え後のタグ一覧が指定されていません');
+  }
+
+  var normalized = requested.map(function (name) { return String(name); });
+  var current = getTags_();
+
+  var sortedRequested = JSON.stringify(normalized.slice().sort());
+  var sortedCurrent = JSON.stringify(current.slice().sort());
+  if (normalized.length !== current.length || sortedRequested !== sortedCurrent) {
+    throw new Error('並び替えの内容が現在のタグ一覧と一致しません。画面を開き直してからやり直してください');
+  }
+
+  saveTags_(normalized);
+  return { ok: true, tags: normalized };
+}
+
+/**
+ * タグ名として使える形に整える純粋関数。
+ * Sheetsのタグ列はカンマ区切りで1セルにまとめるため、区切り文字と誤認されうる , を置換する。
+ */
+function sanitizeTagName_(name) {
+  return String(name || '').trim().replace(/,/g, '、');
+}
+
+/**
  * スクリプトプロパティ SHARED_TOKEN が設定されている場合、
  * リクエストの token と一致するか確認する。未設定なら素通し。
  */
@@ -414,6 +502,40 @@ function getCategories_() {
 /** カテゴリ一覧をスクリプトプロパティへ保存する。 */
 function saveCategories_(categories) {
   PropertiesService.getScriptProperties().setProperty(CATEGORIES_PROPERTY, JSON.stringify(categories));
+}
+
+// ---- タグ一覧の永続化（スクリプトプロパティ） ------------------
+
+/**
+ * 現在のタグ一覧を返す。未初期化・壊れている場合は空配列で初期化してから返す。
+ * カテゴリと異なり初期値は空配列（0件）自体が正常な状態のため、
+ * 「保存されていた配列が空かどうか」では再初期化を判断しない。
+ */
+function getTags_() {
+  var props = PropertiesService.getScriptProperties();
+  var raw = props.getProperty(TAGS_PROPERTY);
+
+  if (!raw) {
+    saveTags_([]);
+    return [];
+  }
+
+  try {
+    var list = JSON.parse(raw);
+    if (Object.prototype.toString.call(list) === '[object Array]') {
+      return list;
+    }
+  } catch (parseErr) {
+    // 壊れていた場合は空配列へフォールバック（下で再初期化する）
+  }
+
+  saveTags_([]);
+  return [];
+}
+
+/** タグ一覧をスクリプトプロパティへ保存する。 */
+function saveTags_(tags) {
+  PropertiesService.getScriptProperties().setProperty(TAGS_PROPERTY, JSON.stringify(tags));
 }
 
 // ---- URL解決 --------------------------------------------------
@@ -473,18 +595,14 @@ function resolveRelativeUrl_(baseUrl, location) {
   return origin + '/' + location;
 }
 
-// ---- タイトル・本文取得 -----------------------------------------
-
-// 本文自動抽出の最大文字数（ファイルサイズ・実行時間対策の簡易上限）
-var BODY_TEXT_MAX = 4000;
+// ---- タイトル取得 -----------------------------------------------
 
 /**
- * URL 先のページからタイトルと本文テキストを取得する。
- * タイトルは <title> → og:title の順、どちらも取れなければ URL をタイトル代わりに使う。
- * 本文は簡易的なHTML→テキスト変換（ナビ・広告等の除去は行わない素朴な実装）。
- * 通信エラー・タイムアウト等はすべて握りつぶし、タイトル=URL・本文=空 で返す。
+ * URL 先のページからタイトルを取得する。
+ * <title> → og:title の順、どちらも取れなければ URL をタイトル代わりに使う。
+ * 通信エラー・タイムアウト等はすべて握りつぶし、URL をタイトル代わりに返す。
  */
-function fetchPageDetails_(url) {
+function fetchPageTitle_(url) {
   try {
     var response = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
@@ -493,7 +611,7 @@ function fetchPageDetails_(url) {
     });
 
     if (response.getResponseCode() >= 400) {
-      return { title: url, bodyText: '' };
+      return url;
     }
 
     // 文字コードの判定: Content-Type ヘッダ → meta タグ の順で charset を探す
@@ -504,12 +622,10 @@ function fetchPageDetails_(url) {
       html = response.getContentText(charset);
     }
 
-    var title = extractTitle_(html) || url;
-    var bodyText = extractBodyText_(html);
-    return { title: title, bodyText: bodyText };
+    return extractTitle_(html) || url;
   } catch (fetchErr) {
     // 取得失敗時は URL そのものをタイトル代わりに使う（仕様のフォールバック）
-    return { title: url, bodyText: '' };
+    return url;
   }
 }
 
@@ -578,55 +694,6 @@ function decodeEntities_(text) {
 }
 
 /**
- * HTML から本文らしきテキストを抽出する純粋関数。
- *
- * 抽出手順:
- *   1. script/style/コメントと、本文でないことが明らかな構造要素
- *      （nav/header/footer/aside = メニュー・ランキング・フッター等）を除去
- *   2. <article> または <main> があればその中身だけを対象にする
- *      （実運用で、サイト共通部品が本文より先に来て4000文字上限を圧迫する
- *        事例があったため。セマンティックタグの無いサイトはページ全体で代替）
- *   3. ブロック要素の境目で改行を入れてから残りのタグを剥がす
- * Readability相当の高度な本文判定ではない点、X/Twitter等JS描画に依存する
- * サイトでは本文がほぼ取れない点は従来と同じ。
- * 長すぎる場合は BODY_TEXT_MAX で打ち切る。
- */
-function extractBodyText_(html) {
-  if (!html) {
-    return '';
-  }
-
-  // ステップ1: 非本文要素の除去
-  var work = html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(nav|header|footer|aside)\b[\s\S]*?<\/\1>/gi, ' ');
-
-  // ステップ2: article/main があればそこだけを本文候補にする
-  var m = work.match(/<article[^>]*>([\s\S]*?)<\/article>/i) ||
-          work.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
-  var target = m ? m[1] : work;
-
-  // ステップ3: ブロック要素の開始位置に改行を入れ（段落感を残すため）、残りのタグを除去
-  var text = target
-    .replace(/<(br|p|div|li|h[1-6]|tr)[^>]*>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ');
-
-  text = decodeEntities_(text);
-  text = text
-    .replace(/[ \t]+/g, ' ')
-    .replace(/ *\n */g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  if (text.length > BODY_TEXT_MAX) {
-    text = text.substring(0, BODY_TEXT_MAX) + '…（以下省略）';
-  }
-  return text;
-}
-
-/**
  * メモがタイトルと実質同じ内容かどうかを判定する純粋関数。
  * Android共有時に「タイトル文字列」がそのままメモとして送られてくることが多く、
  * それをそのまま保存すると本文とメモが同じ内容の二重表示になるため、判定して除外する。
@@ -637,59 +704,7 @@ function isDuplicateMemo_(memo, title) {
   return !!normalizedMemo && normalizedMemo === normalizedTitle;
 }
 
-// ---- Drive 保存 ---------------------------------------------
-
-/**
- * 「ナレッジ/<カテゴリ名>/」フォルダ（無ければ自動作成）に
- * 1記事1ファイルの Googleドキュメントとして保存する。
- *
- * プレーンテキスト/Markdownファイル（text/markdown）ではなく Google Docs
- * ネイティブ形式にしているのは、クラウド版Claudeの Google Drive 連携（自然言語での
- * 自動読み込み）がサポートするMIMEタイプに text/markdown・text/plain が含まれておらず、
- * プレーンテキストのままだとAIがファイルを開けない（スクリーンショット等の代替手段が
- * 必要になる）ことが実運用で判明したため。内容自体はこれまで通りMarkdown記法の文字列を
- * そのままドキュメント本文に流し込む（見た目上は#等の記号が残るプレーンテキスト表示だが、
- * AI・人間どちらにも構造は読み取れる）。
- *
- * url は解決済みの実URL、originalUrl は共有時点の（短縮/リダイレクトの可能性がある）URL。
- * 両者が同じ場合、本文内に共有元URLの行は出さない。
- * 戻り値: { fileName, fileId, fileUrl, savedAt }
- */
-function saveToDrive_(category, url, title, memo, bodyText, originalUrl) {
-  // ステップ1: ルートフォルダ「ナレッジ」を取得（無ければ作成）
-  var rootFolder = getOrCreateRootFolder_();
-
-  // ステップ2: カテゴリフォルダを取得（無ければ作成）
-  var categoryFolder = getOrCreateFolder_(rootFolder, category);
-
-  // ステップ3: ファイル名を組み立てる（タイトル + 日付。重複時は時刻を付けて回避）
-  // タイトルを先頭にするのは、Driveの一覧表示（幅が狭いと末尾が省略される）で
-  // 日付に隠れず記事内容がひと目でわかるようにするため。
-  var now = new Date();
-  var dateStr = Utilities.formatDate(now, TIME_ZONE, 'yyyy-MM-dd');
-  var fileName = buildFileName_(title, dateStr);
-  if (categoryFolder.getFilesByName(fileName).hasNext()) {
-    // 同名ファイルが既にある場合は時刻を付けて別ファイルにする（上書き防止）
-    var timeStr = Utilities.formatDate(now, TIME_ZONE, 'HHmmss');
-    fileName = buildFileName_(title, dateStr + '_' + timeStr);
-  }
-
-  // ステップ4: 本文を組み立てる
-  var savedAt = Utilities.formatDate(now, TIME_ZONE, 'yyyy-MM-dd HH:mm');
-  var content = buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalUrl);
-
-  // ステップ5: Googleドキュメントとして作成し、カテゴリフォルダへ移動する
-  // （DocumentApp.create は既定でマイドライブ直下に作るため、Sheetsインデックスの
-  //   作成と同じ要領で addFile/removeFile により目的のフォルダへ移す）
-  var doc = DocumentApp.create(fileName);
-  var file = DriveApp.getFileById(doc.getId());
-  categoryFolder.addFile(file);
-  DriveApp.getRootFolder().removeFile(file);
-  doc.getBody().setText(content);
-  doc.saveAndClose();
-
-  return { fileName: fileName, fileId: doc.getId(), fileUrl: doc.getUrl(), savedAt: savedAt };
-}
+// ---- Drive（過去のGoogleドキュメント参照用） -----------------
 
 /**
  * 親フォルダ直下から名前一致のフォルダを探し、無ければ作成して返す。
@@ -730,36 +745,9 @@ function getOrCreateRootFolder_() {
 }
 
 /**
- * 「タイトル_YYYY-MM-DD」形式のドキュメント名を組み立てる純粋関数。
- * Googleドキュメントとして保存するため拡張子は付けない
- * （Markdownファイル時代の .md はドキュメント名としては紛らわしいだけなので廃止）。
- * Drive/OS で問題になりうる記号を除去し、長すぎるタイトルは切り詰める。
- */
-function buildFileName_(title, datePart) {
-  var safe = sanitizeFileName_(title);
-  if (!safe) {
-    safe = '無題';
-  }
-  if (safe.length > FILENAME_TITLE_MAX) {
-    safe = safe.substring(0, FILENAME_TITLE_MAX) + '…';
-  }
-  return safe + '_' + datePart;
-}
-
-/**
- * ファイル名に使えない・紛らわしい文字を除去する純粋関数。
- * （Windows 禁止文字 + 制御文字 + 先頭末尾のドット/空白）
- */
-function sanitizeFileName_(name) {
-  return String(name || '')
-    .replace(/[\\/:*?"<>|]/g, ' ')      // Windows で使えない記号をスペースへ
-    .replace(/[\x00-\x1f\x7f]/g, '')     // 制御文字を除去
-    .replace(/\s+/g, ' ')                // 連続空白を1つに
-    .replace(/^[\s.]+|[\s.]+$/g, '');    // 先頭末尾の空白・ドットを除去
-}
-
-/**
  * 保存する Markdown 本文を組み立てる純粋関数。
+ * 新規記事の保存では使わないが、既存Googleドキュメント（action=update）の
+ * 本文再構築に引き続き使用する。
  * タイトル・URL・保存日時・カテゴリ（+任意のメモ・本文）を含める。
  * originalUrl が url と異なる場合のみ「共有時のURL」行を追加する
  * （share.google 等の短縮/リダイレクトリンクだった場合の記録用）。
@@ -798,47 +786,32 @@ function buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalU
 
 /**
  * 検索用インデックス・スプレッドシートの1枚目のシートを取得する。
- * スクリプトプロパティに保存済みのIDがあればそれを開き、
- * 無い（または削除されて開けない）場合は新規作成して「ナレッジ」フォルダに格納する。
- * ルートフォルダの取得は新規作成時にしか必要ないため、その場合だけ行う
- * （一覧APIの通常経路からDriveのフォルダ検索を無くして高速化するため）。
+ * このスクリプトは「ナレッジ一覧」スプレッドシートにコンテナバインドされている前提のため、
+ * getActiveSpreadsheet() で自分自身（バインド先）を直接参照する
+ * （openByIdでの外部参照・IDのスクリプトプロパティ保持は不要）。
+ * シートが空（初回バインド直後等）ならヘッダー行を書き込んで初期化する。
+ * 列追加前から運用しているシート（「タグ」ヘッダーが無い）は、ヘッダーだけ補完する。
  */
 function getOrCreateIndexSheet_() {
-  var props = PropertiesService.getScriptProperties();
-  var sheetId = props.getProperty(INDEX_SHEET_ID_PROPERTY);
-
-  if (sheetId) {
-    try {
-      return SpreadsheetApp.openById(sheetId).getSheets()[0];
-    } catch (openErr) {
-      // 保存されていたIDのファイルが見つからない（手動削除等）→ 作り直す
-    }
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(INDEX_HEADER);
+    sheet.setFrozenRows(1);
+  } else if (!sheet.getRange(1, INDEX_COL.TAGS).getValue()) {
+    sheet.getRange(1, INDEX_COL.TAGS).setValue(INDEX_HEADER[INDEX_COL.TAGS - 1]);
   }
-
-  var spreadsheet = SpreadsheetApp.create(INDEX_SHEET_NAME);
-
-  // 既定ではマイドライブ直下に作られるため、「ナレッジ」フォルダの中へ移動する
-  var file = DriveApp.getFileById(spreadsheet.getId());
-  getOrCreateRootFolder_().addFile(file);
-  DriveApp.getRootFolder().removeFile(file);
-
-  var sheet = spreadsheet.getSheets()[0];
-  sheet.appendRow(INDEX_HEADER);
-  sheet.setFrozenRows(1);
-
-  props.setProperty(INDEX_SHEET_ID_PROPERTY, spreadsheet.getId());
   return sheet;
 }
 
 /**
  * インデックスシートに1行追記する。
- * タイトル列は元記事URLへのHYPERLINK、Driveファイル列は保存したGoogleドキュメントへの
- * HYPERLINKにする（後者は、Drive全文検索のインデックス反映を待たずにAIがファイルへ
- * 直接ジャンプできるようにするための導線）。
+ * タイトル列は元記事URLへのHYPERLINK。Driveファイル列は、以前の運用（Googleドキュメント
+ * への転記）で作成した記事にのみリンクが入っていたため、新規保存では常に空のままにする。
+ * タグ列は複数タグを ", " 区切りで1セルにまとめる（集計・フィルタしやすい形式）。
  */
-function appendIndexRow_(savedAt, category, title, url, memo, fileUrl) {
+function appendIndexRow_(savedAt, category, title, url, memo, tags) {
   var sheet = getOrCreateIndexSheet_();
-  // 自由入力由来の値（タイトル・メモ・カテゴリ）はセル値としてサニタイズする。
+  // 自由入力由来の値（タイトル・メモ・カテゴリ・タグ）はセル値としてサニタイズする。
   // GASの appendRow/setValue は先頭が = の文字列を数式として解釈するため、
   // ページタイトルや共有メモに =IMPORTXML(...) 等が入っていると実行されてしまう。
   sheet.appendRow([
@@ -847,7 +820,8 @@ function appendIndexRow_(savedAt, category, title, url, memo, fileUrl) {
     sanitizeCellText_(title),
     url,
     sanitizeCellText_(memo || ''),
-    ''
+    '',
+    sanitizeCellText_(tags.join(', '))
   ]);
   var lastRow = sheet.getLastRow();
 
@@ -855,11 +829,6 @@ function appendIndexRow_(savedAt, category, title, url, memo, fileUrl) {
   titleCell.setFormula(
     '=HYPERLINK("' + escapeFormulaString_(url) + '","' + escapeFormulaString_(title) + '")'
   );
-
-  if (fileUrl) {
-    var fileCell = sheet.getRange(lastRow, INDEX_COL.FILE);
-    fileCell.setFormula('=HYPERLINK("' + escapeFormulaString_(fileUrl) + '","開く")');
-  }
 }
 
 /**
