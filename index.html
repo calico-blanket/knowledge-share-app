@@ -115,6 +115,16 @@
     /* メモ欄（共有・手動どちらの保存フローでも常に表示する） */
     .memo-input-area { margin-bottom: 16px; }
 
+    /* 記事一覧のキーワード検索欄 */
+    .list-search-input {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #c9cede;
+      border-radius: 10px;
+      font-size: 15px;
+      margin-bottom: 12px;
+    }
+
     /* タグ選択チップ: スマホの指でも押しやすいよう44px以上の高さを確保する */
     .tag-grid {
       display: flex;
@@ -424,6 +434,7 @@
     <div id="listItemsView" class="hidden">
       <button id="listItemsBackButton" class="link-button" type="button">← カテゴリ選択に戻る</button>
       <p id="listItemsTitle" class="section-title"></p>
+      <input type="search" id="listSearchInput" class="list-search-input" placeholder="タイトル・メモ・タグで検索">
       <div id="listItemsContainer"></div>
     </div>
 
@@ -482,7 +493,7 @@
     // selectedCategory / selectedTags は保存画面で選択中の内容（確定ボタンを押すまで保存しない）
     var state = {
       categories: [], tags: [], rootFolderUrl: '',
-      listCategory: '', listItems: [], editingItem: null,
+      listCategory: '', listItems: [], listKeyword: '', editingItem: null,
       selectedCategory: '', selectedTags: []
     };
 
@@ -964,9 +975,13 @@
     async function openListItemsView(category) {
       document.getElementById('listItemsTitle').textContent = category + ' の記事一覧';
       var container = document.getElementById('listItemsContainer');
+      var searchInput = document.getElementById('listSearchInput');
       showView('listItemsView');
 
       state.listCategory = category;
+      state.listKeyword = '';
+      searchInput.value = '';
+
       var cacheMap = loadCache(LIST_CACHE_KEY) || {};
       var cached = cacheMap[category];
       var hasCache = !!(cached && Array.isArray(cached.items));
@@ -980,8 +995,8 @@
         var result = await gasGet('list', { category: category, offset: 0 });
         if (!result.ok) { throw new Error(result.error || '取得に失敗しました'); }
 
-        // 別のカテゴリへ移動済みなら（連続タップ等）、古い応答で画面を上書きしない
-        if (state.listCategory !== category) { return; }
+        // 別のカテゴリへ移動済み・検索中なら（連続タップ等）、古い応答で画面を上書きしない
+        if (state.listCategory !== category || state.listKeyword) { return; }
 
         var fresh = { items: result.items, hasMore: !!result.hasMore };
         var changed = !hasCache || JSON.stringify(cached) !== JSON.stringify(fresh);
@@ -997,18 +1012,21 @@
       }
     }
 
-    /** 「さらに読み込む」: 表示済み件数を offset にして続きのページを取得・追記する */
+    /** 「さらに読み込む」: 表示済み件数を offset にして続きのページを取得・追記する（検索中はキーワードを引き継ぐ） */
     async function loadMoreListItems() {
       var category = state.listCategory;
+      var keyword = state.listKeyword;
       var button = document.getElementById('loadMoreButton');
       if (button) {
         button.disabled = true;
         button.textContent = '読み込み中…';
       }
       try {
-        var result = await gasGet('list', { category: category, offset: state.listItems.length });
+        var params = { category: category, offset: state.listItems.length };
+        if (keyword) { params.keyword = keyword; }
+        var result = await gasGet('list', params);
         if (!result.ok) { throw new Error(result.error || '取得に失敗しました'); }
-        if (state.listCategory !== category) { return; }
+        if (state.listCategory !== category || state.listKeyword !== keyword) { return; }
         renderListItems(state.listItems.concat(result.items), !!result.hasMore);
       } catch (err) {
         console.error('続きの読み込みに失敗しました:', err);
@@ -1016,6 +1034,45 @@
           button.disabled = false;
           button.textContent = 'さらに読み込む（通信エラー・再試行）';
         }
+      }
+    }
+
+    var listSearchDebounceTimer = null;
+
+    /** 検索欄の入力イベント: 連続入力を吸収するため、一定時間タイプが止まってから検索を実行する */
+    function scheduleListSearch() {
+      if (listSearchDebounceTimer) { clearTimeout(listSearchDebounceTimer); }
+      listSearchDebounceTimer = setTimeout(runListSearch, 300);
+    }
+
+    /**
+     * 検索欄の内容でカテゴリ内の記事を絞り込む。
+     * キーワードが空になったら通常の一覧表示（キャッシュ即描画→裏で再取得）へ戻す。
+     * キーワードがある間はキャッシュを使わず、常にGASへ直接問い合わせる。
+     */
+    async function runListSearch() {
+      var category = state.listCategory;
+      var keyword = document.getElementById('listSearchInput').value.trim();
+
+      if (!keyword) {
+        if (state.listKeyword) { await openListItemsView(category); }
+        return;
+      }
+
+      state.listKeyword = keyword;
+      var container = document.getElementById('listItemsContainer');
+      container.innerHTML = '<p class="empty-state">検索中…</p>';
+
+      try {
+        var result = await gasGet('list', { category: category, offset: 0, keyword: keyword });
+        if (!result.ok) { throw new Error(result.error || '検索に失敗しました'); }
+        if (state.listCategory !== category || state.listKeyword !== keyword) { return; }
+        renderListItems(result.items, !!result.hasMore);
+      } catch (err) {
+        console.error('検索に失敗しました:', err);
+        if (state.listCategory !== category || state.listKeyword !== keyword) { return; }
+        container.innerHTML =
+          '<p class="empty-state">検索に失敗しました: ' + escapeHtml(String(err.message || err)) + '</p>';
       }
     }
 
@@ -1427,6 +1484,7 @@
         showView('mainView');
       });
       document.getElementById('listItemsBackButton').addEventListener('click', openListCategoryView);
+      document.getElementById('listSearchInput').addEventListener('input', scheduleListSearch);
 
       // 記事編集ビュー: 更新ボタン・戻るボタン
       document.getElementById('editSaveButton').addEventListener('click', submitEdit);

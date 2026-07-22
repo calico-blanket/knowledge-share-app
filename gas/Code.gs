@@ -81,7 +81,7 @@ function doGet(e) {
   var action = e && e.parameter && e.parameter.action;
   var token = String((e && e.parameter && e.parameter.token) || '');
   if (action === 'list') {
-    return handleList_(e.parameter.category, token, e.parameter.offset);
+    return handleList_(e.parameter.category, token, e.parameter.offset, e.parameter.keyword);
   }
   if (action === 'categories') {
     return handleCategories_(token);
@@ -112,10 +112,12 @@ function handleCategories_(token) {
 
 /**
  * 指定カテゴリの保存済み記事一覧を、検索用インデックス（Sheets）から新しい順に返す。
- * 一度に返すのは LIST_PAGE_SIZE 件まで。offset（新しい順で何件目から）を指定すると
- * 続きのページを返し、まだ続きがある場合はレスポンスに hasMore: true を含める。
+ * keyword を指定すると、タイトル・メモ・タグのいずれかに部分一致（大文字小文字を
+ * 区別しない）する記事だけに絞り込んでからページングする（URLは絞り込み対象外）。
+ * 一度に返すのは LIST_PAGE_SIZE 件まで。offset（絞り込み後・新しい順で何件目から）を
+ * 指定すると続きのページを返し、まだ続きがある場合はレスポンスに hasMore: true を含める。
  */
-function handleList_(category, token, offsetParam) {
+function handleList_(category, token, offsetParam, keywordParam) {
   try {
     checkToken_(token);
     if (!category || getCategories_().indexOf(category) === -1) {
@@ -127,6 +129,8 @@ function handleList_(category, token, offsetParam) {
     if (isNaN(offset) || offset < 0) {
       offset = 0;
     }
+
+    var keyword = String(keywordParam || '').trim().toLowerCase();
 
     var sheet = getOrCreateIndexSheet_();
     var values = sheet.getDataRange().getValues(); // values[0] はヘッダ行
@@ -140,12 +144,18 @@ function handleList_(category, token, offsetParam) {
       : [];
 
     var items = [];
-    var matched = 0;   // このカテゴリで何件目まで見たか（offsetの読み飛ばし用）
+    var matched = 0;   // このカテゴリ・キーワード条件で何件目まで見たか（offsetの読み飛ばし用）
     var hasMore = false;
     // 新しい順（末尾の行から）に走査し、offset分を読み飛ばして1ページ分集める
     for (var i = values.length - 1; i >= 1; i--) {
       var row = values[i];
       if (row[INDEX_COL.CATEGORY - 1] !== category) {
+        continue;
+      }
+      var title = row[INDEX_COL.TITLE - 1];
+      var memo = row[INDEX_COL.MEMO - 1] || '';
+      var tagsText = row[INDEX_COL.TAGS - 1] || '';
+      if (keyword && !rowMatchesKeyword_(title, memo, tagsText, keyword)) {
         continue;
       }
       matched++;
@@ -159,9 +169,10 @@ function handleList_(category, token, offsetParam) {
       var fileFormula = fileFormulas[i - 1] ? fileFormulas[i - 1][0] : '';
       items.push({
         savedAt: row[INDEX_COL.SAVED_AT - 1],
-        title: row[INDEX_COL.TITLE - 1],
+        title: title,
         url: row[INDEX_COL.URL - 1],
-        memo: row[INDEX_COL.MEMO - 1] || '',
+        memo: memo,
+        tags: splitTagsText_(tagsText),
         fileId: extractFileIdFromFormula_(fileFormula)
       });
     }
@@ -172,6 +183,22 @@ function handleList_(category, token, offsetParam) {
   } catch (err) {
     return jsonResponse_({ ok: false, error: String((err && err.message) || err) });
   }
+}
+
+/**
+ * 検索対象3項目（タイトル・メモ・タグ文字列）のいずれかに、小文字化済みキーワードが
+ * 部分一致するかを判定する純粋関数（URLは検索対象に含めない）。
+ */
+function rowMatchesKeyword_(title, memo, tagsText, lowerKeyword) {
+  return String(title).toLowerCase().indexOf(lowerKeyword) !== -1
+    || String(memo).toLowerCase().indexOf(lowerKeyword) !== -1
+    || String(tagsText).toLowerCase().indexOf(lowerKeyword) !== -1;
+}
+
+/** インデックスシートのタグ列（", " 区切り文字列）を、前後空白除去済みの配列に戻す */
+function splitTagsText_(tagsText) {
+  if (!tagsText) { return []; }
+  return String(tagsText).split(',').map(function (t) { return t.trim(); }).filter(function (t) { return t; });
 }
 
 /**
