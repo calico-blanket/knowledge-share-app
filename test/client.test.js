@@ -384,6 +384,49 @@ test('タグ管理（設定画面）: 追加・削除・並び替えのGASアク
   assert.match(html, /action: 'reorderTags'/, 'reorderTagsアクションを送ること');
 });
 
+// ---- キーワード検索（一覧のフィルター） --------------------------------
+
+test('検索UI: 一覧画面に検索入力欄があり、input時にscheduleListSearchが呼ばれる', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /id="listSearchInput"/, '検索入力欄が存在すること');
+  // listItemsContainer より前（タイトルの直後）に配置されていること
+  const view = html.match(/<div id="listItemsView"[\s\S]*?<\/div>/);
+  assert.ok(view, 'listItemsViewが存在すること');
+  assert.ok(
+    view[0].indexOf('id="listSearchInput"') < view[0].indexOf('id="listItemsContainer"'),
+    '検索欄は記事一覧より上に配置されていること'
+  );
+  assert.match(
+    html, /getElementById\('listSearchInput'\)\.addEventListener\('input', scheduleListSearch\)/,
+    '検索欄の入力でscheduleListSearchを呼ぶこと'
+  );
+});
+
+test('検索UI: openListItemsViewはカテゴリを開くたびに検索状態と検索欄をリセットする', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function openListItemsView\(category\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'openListItemsView関数が存在すること');
+  assert.match(m[1], /state\.listKeyword = ''/, 'state.listKeywordを空にリセットすること');
+  assert.match(m[1], /searchInput\.value = ''/, '検索入力欄の表示値もリセットすること');
+});
+
+test('検索UI: runListSearchはkeywordを付けてGASへ問い合わせ、結果でstate.listKeywordを更新する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function runListSearch\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'runListSearch関数が存在すること');
+  assert.match(m[1], /gasGet\('list', \{ category: category, offset: 0, keyword: keyword \}\)/, 'keywordを付けて検索すること');
+  assert.match(m[1], /state\.listKeyword = keyword/, '検索中のキーワードをstateへ保持すること');
+  assert.match(m[1], /await openListItemsView\(category\)/, 'キーワードが空になったら通常の一覧表示へ戻ること');
+});
+
+test('検索UI: 「さらに読み込む」は検索中のキーワードを引き継いで続きを取得する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function loadMoreListItems\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'loadMoreListItems関数が存在すること');
+  assert.match(m[1], /var keyword = state\.listKeyword/, '検索中のキーワードを引き継ぐこと');
+  assert.match(m[1], /if \(keyword\) \{ params\.keyword = keyword; \}/, 'keywordがある場合のみパラメータへ付与すること');
+});
+
 test('カテゴリ・タグ管理: 設定画面を開くと両方のセクションがまとめて表示・取得される（refreshManageUi）', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/async function refreshManageUi\(\) \{([\s\S]*?)\n    \}/);

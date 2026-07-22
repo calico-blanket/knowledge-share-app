@@ -271,9 +271,9 @@ function callDoPost(context, bodyObj) {
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=list&category=...&token=...&offset=... 相当のパラメータで呼び、レスポンスJSONを返す */
-function callDoGetList(context, category, token, offset) {
-  const e = { parameter: { action: 'list', category: category, token: token, offset: offset } };
+/** doGet を ?action=list&category=...&token=...&offset=...&keyword=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetList(context, category, token, offset, keyword) {
+  const e = { parameter: { action: 'list', category: category, token: token, offset: offset, keyword: keyword } };
   const output = context.doGet(e);
   return JSON.parse(output.getContent());
 }
@@ -525,6 +525,102 @@ test('doGet: eが空でも落ちない', () => {
   const output = context.doGet(undefined);
   const result = JSON.parse(output.getContent());
   assert.strictEqual(result.ok, true);
+});
+
+// ---- 一覧API: タグ情報の同梱 ---------------------------------------
+
+test('一覧API: 各記事にtags配列が含まれる（保存時のタグをそのまま反映）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  callDoPost(context, { action: 'addTag', name: 'タグB' });
+  callDoPost(context, { url: 'https://example.com/multi', category: 'PC系', tags: ['タグA', 'タグB'] });
+  callDoPost(context, { url: 'https://example.com/notag', category: 'PC系' });
+
+  const result = callDoGetList(context, 'PC系');
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.items[0].tags, [], 'タグ未指定の記事は空配列');
+  assert.deepStrictEqual(result.items[1].tags, ['タグA', 'タグB'], '複数タグは配列で返る');
+});
+
+// ---- 一覧API: キーワード検索 -----------------------------------------
+
+test('キーワード検索: タイトルに部分一致する記事だけ返す', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => makeFetchResponse({
+      body: '<title>' + (url.indexOf('/hit') !== -1 ? '当たりの記事' : 'はずれの記事') + '</title>'
+    })
+  });
+  callDoPost(context, { url: 'https://example.com/hit', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/miss', category: 'PC系' });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, '当たり');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].title, '当たりの記事');
+});
+
+test('キーワード検索: メモに部分一致する記事だけ返す', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/memo1', category: 'PC系', memo: '重要な備忘録' });
+  callDoPost(context, { url: 'https://example.com/memo2', category: 'PC系', memo: '関係ないメモ' });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, '備忘録');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].url, 'https://example.com/memo1');
+});
+
+test('キーワード検索: タグに部分一致する記事だけ返す', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: '要対応' });
+  callDoPost(context, { url: 'https://example.com/tagged', category: 'PC系', tags: ['要対応'] });
+  callDoPost(context, { url: 'https://example.com/untagged', category: 'PC系' });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, '要対応');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].url, 'https://example.com/tagged');
+});
+
+test('キーワード検索: URLは検索対象外（URLに含まれる文字列だけでは一致しない）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/uniquepath123', category: 'PC系', memo: 'メモなし' });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, 'uniquepath123');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 0, 'URL一致だけではヒットしないこと');
+});
+
+test('キーワード検索: 大文字小文字を区別しない', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/case', category: 'PC系', memo: 'ImportantNote' });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, 'importantnote');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+});
+
+test('キーワード検索: 空文字・未指定は絞り込まない（全件返す）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/x1', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/x2', category: 'PC系' });
+
+  const withUndefined = callDoGetList(context, 'PC系');
+  const withEmpty = callDoGetList(context, 'PC系', undefined, undefined, '   ');
+  assert.strictEqual(withUndefined.items.length, 2);
+  assert.strictEqual(withEmpty.items.length, 2, '空白のみのキーワードも未指定扱い');
+});
+
+test('キーワード検索: 絞り込み後の件数でoffset/hasMoreページングが機能する', () => {
+  const { context } = loadGasScript();
+  for (let i = 0; i < 3; i++) {
+    callDoPost(context, { url: 'https://example.com/hit' + i, category: 'PC系', memo: 'ヒットワード' });
+  }
+  callDoPost(context, { url: 'https://example.com/miss', category: 'PC系', memo: '関係なし' });
+
+  const page1 = callDoGetList(context, 'PC系', undefined, undefined, 'ヒットワード');
+  assert.strictEqual(page1.items.length, 3, '該当3件のみが対象（非該当1件は除外）');
+  assert.strictEqual(page1.hasMore, false);
 });
 
 test('escapeFormulaString_: ダブルクォートが二重化される（数式インジェクション対策）', () => {
@@ -1100,6 +1196,31 @@ test('一覧API: offset指定で続きのページが取得でき、最後のペ
   assert.strictEqual(page2.hasMore, false, '最後のページではフラグが下りる');
   assert.strictEqual(page2.items[0].title, '記事4');
   assert.strictEqual(page2.items[4].title, '記事0', '最古の保存が末尾に来る');
+});
+
+test('キーワード検索: 絞り込み後の件数が50件を超える場合もページングが正しく機能する（非該当行を挟んでも境界がずれない）', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => makeFetchResponse({ body: '<title>記事' + url.split('/').pop() + '</title>' })
+  });
+  // ヒット55件の間に非該当10件を挟み込み、フィルタ後の順序・境界がずれないことを検証する
+  for (let i = 0; i < 55; i++) {
+    callDoPost(context, { url: 'https://example.com/hit' + i, category: 'PC系', memo: '検索対象ワード' });
+    if (i % 5 === 0) {
+      callDoPost(context, { url: 'https://example.com/miss' + i, category: 'PC系', memo: '無関係' });
+    }
+  }
+
+  const page1 = callDoGetList(context, 'PC系', undefined, undefined, '検索対象ワード');
+  assert.strictEqual(page1.ok, true);
+  assert.strictEqual(page1.items.length, 50, '該当55件のうち先頭ページは50件');
+  assert.strictEqual(page1.hasMore, true);
+  assert.strictEqual(page1.items[0].title, '記事hit54', '該当分のみを新しい順で数えた先頭');
+
+  const page2 = callDoGetList(context, 'PC系', undefined, '50', '検索対象ワード');
+  assert.strictEqual(page2.ok, true);
+  assert.strictEqual(page2.items.length, 5, '該当分の残り5件');
+  assert.strictEqual(page2.hasMore, false);
+  assert.strictEqual(page2.items[4].title, '記事hit0', '該当分の最古が末尾に来る');
 });
 
 test('一覧API: offsetが不正な値（負数・文字列）の場合は先頭ページとして扱う', () => {
