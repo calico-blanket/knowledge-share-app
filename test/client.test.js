@@ -427,6 +427,68 @@ test('検索UI: 「さらに読み込む」は検索中のキーワードを引�
   assert.match(m[1], /if \(keyword\) \{ params\.keyword = keyword; \}/, 'keywordがある場合のみパラメータへ付与すること');
 });
 
+// ---- カテゴリ横断キーワード検索 ---------------------------------------
+
+test('横断検索UI: ヘッダーに検索ボタンがあり、クリックでopenSearchViewを呼ぶ', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const header = html.match(/<header>[\s\S]*?<\/header>/);
+  assert.ok(header, 'headerが存在すること');
+  assert.match(header[0], /id="searchButton"/, 'ヘッダーに検索ボタンがあること');
+  assert.match(
+    html, /getElementById\('searchButton'\)\.addEventListener\('click', openSearchView\)/,
+    '検索ボタンのクリックでopenSearchViewを呼ぶこと'
+  );
+});
+
+test('横断検索UI: searchViewがVIEW_IDSに含まれ、検索欄・結果コンテナのDOM idが揃っている', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /VIEW_IDS = \[[\s\S]*?'searchView'[\s\S]*?\]/, 'VIEW_IDSにsearchViewが含まれること');
+  ['searchView', 'searchBackButton', 'searchKeywordInput', 'searchItemsContainer'].forEach(function (id) {
+    assert.match(html, new RegExp('id="' + id + '"'), 'id="' + id + '" が存在すること');
+  });
+});
+
+test('横断検索UI: openSearchViewは検索状態をリセットしてから検索ビューを開く', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function openSearchView\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'openSearchView関数が存在すること');
+  assert.match(m[1], /state\.searchKeyword = ''/, '前回の検索キーワードをリセットすること');
+  assert.match(m[1], /getElementById\('searchKeywordInput'\)\.value = ''/, '検索入力欄の表示値もリセットすること');
+  assert.match(m[1], /showView\('searchView'\)/, '検索ビューを表示すること');
+});
+
+test('横断検索UI: 検索欄の入力でscheduleGlobalSearchが呼ばれる', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(
+    html, /getElementById\('searchKeywordInput'\)\.addEventListener\('input', scheduleGlobalSearch\)/,
+    '検索欄の入力でscheduleGlobalSearchを呼ぶこと'
+  );
+});
+
+test('横断検索UI: runGlobalSearchはcategory無しでGASのsearchアクションを呼ぶ（カテゴリ横断）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function runGlobalSearch\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'runGlobalSearch関数が存在すること');
+  assert.match(m[1], /gasGet\('search', \{ offset: 0, keyword: keyword \}\)/, 'categoryを指定せずsearchアクションを呼ぶこと');
+  assert.match(m[1], /state\.searchKeyword = keyword/, '検索中のキーワードをstateへ保持すること');
+});
+
+test('横断検索UI: 「さらに読み込む」は検索中のキーワードを引き継いで続きを取得する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function loadMoreSearchItems\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'loadMoreSearchItems関数が存在すること');
+  assert.match(m[1], /var keyword = state\.searchKeyword/, '検索中のキーワードを引き継ぐこと');
+  assert.match(m[1], /gasGet\('search', \{ offset: state\.searchItems\.length, keyword: keyword \}\)/);
+});
+
+test('横断検索UI: renderSearchItemsは各記事にカテゴリ名を表示し、編集ボタンは出さない', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function renderSearchItems\(items, hasMore\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderSearchItems関数が存在すること');
+  assert.match(m[1], /item\.category/, 'カテゴリ名を表示に使うこと');
+  assert.doesNotMatch(m[1], /openEditView/, '検索結果からは編集ビューを開かないこと（編集ボタンを出さない）');
+});
+
 test('カテゴリ・タグ管理: 設定画面を開くと両方のセクションがまとめて表示・取得される（refreshManageUi）', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/async function refreshManageUi\(\) \{([\s\S]*?)\n    \}/);
