@@ -278,6 +278,13 @@ function callDoGetList(context, category, token, offset, keyword) {
   return JSON.parse(output.getContent());
 }
 
+/** doGet を ?action=search&keyword=...&token=...&offset=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetSearch(context, keyword, token, offset) {
+  const e = { parameter: { action: 'search', keyword: keyword, token: token, offset: offset } };
+  const output = context.doGet(e);
+  return JSON.parse(output.getContent());
+}
+
 /** doGet を ?action=categories&token=... で呼び、レスポンスJSONを返す */
 function callDoGetCategories(context, token) {
   const output = context.doGet({ parameter: { action: 'categories', token: token } });
@@ -1223,6 +1230,78 @@ test('キーワード検索: 絞り込み後の件数が50件を超える場合�
   assert.strictEqual(page2.items[4].title, '記事hit0', '該当分の最古が末尾に来る');
 });
 
+// ---- カテゴリ横断検索API(action=search) -------------------------------
+
+test('カテゴリ横断検索: 複数カテゴリにまたがる該当記事を新しい順にまとめて返し、各記事にcategoryを含める', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/pc', category: 'PC系', memo: '横断ワード入り' });
+  callDoPost(context, { url: 'https://example.com/dtp', category: 'DTP系', memo: '横断ワード入り' });
+  callDoPost(context, { url: 'https://example.com/other', category: 'PC系', memo: '無関係' });
+
+  const result = callDoGetSearch(context, '横断ワード');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 2, 'カテゴリをまたいで該当分のみ返る');
+  assert.strictEqual(result.items[0].category, 'DTP系', '新しい順で先頭は直近保存のDTP系');
+  assert.strictEqual(result.items[1].category, 'PC系');
+});
+
+test('カテゴリ横断検索: URLは検索対象外、大文字小文字は区別しない', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/uniquepath999', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/case', category: 'DTP系', memo: 'CrossCategoryHit' });
+
+  const urlOnly = callDoGetSearch(context, 'uniquepath999');
+  assert.strictEqual(urlOnly.items.length, 0, 'URL一致だけではヒットしないこと');
+
+  const caseInsensitive = callDoGetSearch(context, 'crosscategoryhit');
+  assert.strictEqual(caseInsensitive.items.length, 1);
+});
+
+test('カテゴリ横断検索: keyword未指定・空文字は絞り込まず全カテゴリの全件を返す', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/b', category: 'DTP系' });
+
+  const withUndefined = callDoGetSearch(context, undefined);
+  const withBlank = callDoGetSearch(context, '   ');
+  assert.strictEqual(withUndefined.items.length, 2);
+  assert.strictEqual(withBlank.items.length, 2);
+});
+
+test('カテゴリ横断検索: SHARED_TOKEN設定時、合言葉が違うと拒否される', () => {
+  const { context } = loadGasScript({ scriptProperties: { SHARED_TOKEN: 'himitsu' } });
+  const result = callDoGetSearch(context, 'x', 'chigau');
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('カテゴリ横断検索: 該当件数が50件を超える場合もoffset/hasMoreページングが機能する', () => {
+  const { context } = loadGasScript({
+    fetchImpl: (url) => makeFetchResponse({ body: '<title>記事' + url.split('/').pop() + '</title>' })
+  });
+  const categories = ['PC系', 'DTP系'];
+  for (let i = 0; i < 55; i++) {
+    callDoPost(context, {
+      url: 'https://example.com/hit' + i, category: categories[i % 2], memo: '横断検索対象'
+    });
+  }
+
+  const page1 = callDoGetSearch(context, '横断検索対象');
+  assert.strictEqual(page1.items.length, 50);
+  assert.strictEqual(page1.hasMore, true);
+
+  const page2 = callDoGetSearch(context, '横断検索対象', undefined, '50');
+  assert.strictEqual(page2.items.length, 5);
+  assert.strictEqual(page2.hasMore, false);
+});
+
+test('一覧API: レスポンスのitemsにcategoryが含まれる（カテゴリ内一覧でも横断検索と同じ形式）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/x', category: 'PC系' });
+  const result = callDoGetList(context, 'PC系');
+  assert.strictEqual(result.items[0].category, 'PC系');
+});
+
 test('一覧API: offsetが不正な値（負数・文字列）の場合は先頭ページとして扱う', () => {
   const { context } = loadGasScript({
     fetchImpl: () => makeFetchResponse({ body: '<title>1件だけ</title>' })
@@ -1450,7 +1529,8 @@ test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（�
     'appendIndexRow_', 'doGet', 'doPost', 'handleUpdate_', 'extractFileIdFromFormula_',
     'rebuildDocContent_', 'extractDocOriginalUrl_', 'extractDocBodyText_',
     'getTags_', 'saveTags_', 'sanitizeTagName_', 'normalizeTagsInput_',
-    'handleAddTag_', 'handleRemoveTag_', 'handleReorderTags_', 'fetchPageTitle_'
+    'handleAddTag_', 'handleRemoveTag_', 'handleReorderTags_', 'fetchPageTitle_',
+    'handleSearch_', 'collectListItems_', 'normalizeOffset_', 'normalizeKeyword_'
   ];
   for (const fn of names) {
     const definitions = source.match(new RegExp('function ' + fn + '\\(', 'g')) || [];

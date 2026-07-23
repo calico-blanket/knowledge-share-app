@@ -356,6 +356,7 @@
     <div class="header-icons">
       <button id="driveShortcutButton" class="icon-button" type="button" aria-label="Driveを開く">📁</button>
       <button id="listButton" class="icon-button" type="button" aria-label="一覧">📋</button>
+      <button id="searchButton" class="icon-button" type="button" aria-label="検索">🔍</button>
       <button id="settingsButton" class="icon-button" type="button" aria-label="設定">⚙</button>
       <button id="exitButton" class="icon-button" type="button" aria-label="終了">✕</button>
     </div>
@@ -438,6 +439,14 @@
       <div id="listItemsContainer"></div>
     </div>
 
+    <!-- ビュー4b: カテゴリ横断キーワード検索 -->
+    <div id="searchView" class="hidden">
+      <button id="searchBackButton" class="link-button" type="button">← 保存画面に戻る</button>
+      <p class="section-title">キーワード検索（全カテゴリ）</p>
+      <input type="search" id="searchKeywordInput" class="list-search-input" placeholder="タイトル・メモ・タグで検索">
+      <div id="searchItemsContainer"></div>
+    </div>
+
     <!-- ビュー5: 完了（送信は fire-and-forget のため、送信直後に表示する） -->
     <div id="doneView" class="status-panel hidden">
       <div class="icon">✅</div>
@@ -494,7 +503,8 @@
     var state = {
       categories: [], tags: [], rootFolderUrl: '',
       listCategory: '', listItems: [], listKeyword: '', editingItem: null,
-      selectedCategory: '', selectedTags: []
+      selectedCategory: '', selectedTags: [],
+      searchKeyword: '', searchItems: []
     };
 
     // ============================================================
@@ -650,7 +660,7 @@
     // ============================================================
 
     var VIEW_IDS = [
-      'mainView', 'settingsView', 'listCategoryView', 'listItemsView',
+      'mainView', 'settingsView', 'listCategoryView', 'listItemsView', 'searchView',
       'doneView', 'errorView', 'editView'
     ];
 
@@ -1156,6 +1166,139 @@
     }
 
     // ============================================================
+    // カテゴリ横断キーワード検索（ヘッダーの🔍ボタンから開く）
+    // ============================================================
+
+    /** 検索ビューを開く。前回の検索状態は引き継がず、常に空の状態から始める */
+    function openSearchView() {
+      state.searchKeyword = '';
+      state.searchItems = [];
+      document.getElementById('searchKeywordInput').value = '';
+      document.getElementById('searchItemsContainer').innerHTML =
+        '<p class="empty-state">キーワードを入力してください</p>';
+      showView('searchView');
+      document.getElementById('searchKeywordInput').focus();
+    }
+
+    var globalSearchDebounceTimer = null;
+
+    /** 検索欄の入力イベント: 連続入力を吸収するため、一定時間タイプが止まってから検索を実行する */
+    function scheduleGlobalSearch() {
+      if (globalSearchDebounceTimer) { clearTimeout(globalSearchDebounceTimer); }
+      globalSearchDebounceTimer = setTimeout(runGlobalSearch, 300);
+    }
+
+    /** 検索欄の内容で、全カテゴリを横断して記事を検索する */
+    async function runGlobalSearch() {
+      var keyword = document.getElementById('searchKeywordInput').value.trim();
+      state.searchKeyword = keyword;
+      var container = document.getElementById('searchItemsContainer');
+
+      if (!keyword) {
+        state.searchItems = [];
+        container.innerHTML = '<p class="empty-state">キーワードを入力してください</p>';
+        return;
+      }
+
+      container.innerHTML = '<p class="empty-state">検索中…</p>';
+      try {
+        var result = await gasGet('search', { offset: 0, keyword: keyword });
+        if (!result.ok) { throw new Error(result.error || '検索に失敗しました'); }
+        if (state.searchKeyword !== keyword) { return; } // 検索中に入力が変わっていたら古い応答は捨てる
+        renderSearchItems(result.items, !!result.hasMore);
+      } catch (err) {
+        console.error('横断検索に失敗しました:', err);
+        if (state.searchKeyword !== keyword) { return; }
+        container.innerHTML =
+          '<p class="empty-state">検索に失敗しました: ' + escapeHtml(String(err.message || err)) + '</p>';
+      }
+    }
+
+    /** 「さらに読み込む」: 表示済み件数を offset にして続きのページを取得・追記する */
+    async function loadMoreSearchItems() {
+      var keyword = state.searchKeyword;
+      var button = document.getElementById('loadMoreSearchButton');
+      if (button) {
+        button.disabled = true;
+        button.textContent = '読み込み中…';
+      }
+      try {
+        var result = await gasGet('search', { offset: state.searchItems.length, keyword: keyword });
+        if (!result.ok) { throw new Error(result.error || '取得に失敗しました'); }
+        if (state.searchKeyword !== keyword) { return; }
+        renderSearchItems(state.searchItems.concat(result.items), !!result.hasMore);
+      } catch (err) {
+        console.error('続きの読み込みに失敗しました:', err);
+        if (button) {
+          button.disabled = false;
+          button.textContent = 'さらに読み込む（通信エラー・再試行）';
+        }
+      }
+    }
+
+    /**
+     * 横断検索の結果一覧を描画する。renderListItemsと似た構造だが、複数カテゴリが
+     * 混在するため各記事にカテゴリ名を表示する。編集は通常のカテゴリ一覧から行う
+     * 運用とし、ここでは編集ボタンは出さない（検索は記事を見つけるための機能）。
+     */
+    function renderSearchItems(items, hasMore) {
+      var container = document.getElementById('searchItemsContainer');
+      container.innerHTML = '';
+      state.searchItems = items; // 「さらに読み込む」の offset 計算用に表示中の一覧を覚える
+
+      if (!items.length) {
+        var empty = document.createElement('p');
+        empty.className = 'empty-state';
+        empty.textContent = '該当する記事が見つかりません';
+        container.appendChild(empty);
+        return;
+      }
+
+      items.forEach(function (item) {
+        var row = document.createElement('div');
+        row.className = 'list-item-row';
+
+        var link = document.createElement('a');
+        link.className = 'list-item';
+        if (/^https?:\/\//i.test(item.url)) {
+          link.href = item.url;
+          link.target = '_blank';
+          link.rel = 'noopener';
+        }
+
+        var meta = document.createElement('div');
+        meta.className = 'list-item-date';
+        meta.textContent = item.savedAt + '・' + item.category;
+        link.appendChild(meta);
+
+        var title = document.createElement('div');
+        title.className = 'list-item-title';
+        title.textContent = item.title;
+        link.appendChild(title);
+
+        if (item.memo) {
+          var memo = document.createElement('div');
+          memo.className = 'list-item-memo';
+          memo.textContent = item.memo;
+          link.appendChild(memo);
+        }
+
+        row.appendChild(link);
+        container.appendChild(row);
+      });
+
+      if (hasMore) {
+        var moreButton = document.createElement('button');
+        moreButton.type = 'button';
+        moreButton.id = 'loadMoreSearchButton';
+        moreButton.className = 'load-more-button';
+        moreButton.textContent = 'さらに読み込む';
+        moreButton.addEventListener('click', loadMoreSearchItems);
+        container.appendChild(moreButton);
+      }
+    }
+
+    // ============================================================
     // 記事の編集（一覧の「編集」ボタンから開く）
     // ============================================================
 
@@ -1485,6 +1628,13 @@
       });
       document.getElementById('listItemsBackButton').addEventListener('click', openListCategoryView);
       document.getElementById('listSearchInput').addEventListener('input', scheduleListSearch);
+
+      // カテゴリ横断キーワード検索ビュー
+      document.getElementById('searchButton').addEventListener('click', openSearchView);
+      document.getElementById('searchBackButton').addEventListener('click', function () {
+        showView('mainView');
+      });
+      document.getElementById('searchKeywordInput').addEventListener('input', scheduleGlobalSearch);
 
       // 記事編集ビュー: 更新ボタン・戻るボタン
       document.getElementById('editSaveButton').addEventListener('click', submitEdit);

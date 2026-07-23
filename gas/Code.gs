@@ -72,6 +72,7 @@ var LIST_PAGE_SIZE = 50;
  * GET エンドポイント。
  * - パラメータ無し: 動作確認用メッセージを返す（合言葉不要の稼働確認）
  * - ?action=list&category=xxx&token=xxx : そのカテゴリの保存済み記事一覧を返す
+ * - ?action=search&keyword=xxx&token=xxx : カテゴリを横断してキーワード検索した結果を返す
  * - ?action=categories&token=xxx : カテゴリ一覧とDriveの「ナレッジ」フォルダURLを返す
  * データを返す action は、POSTと同様に SHARED_TOKEN（設定時）の照合を必須とする。
  * 記事一覧はタイトル・URL・メモといった個人の閲覧記録に近い情報を含むため、
@@ -82,6 +83,9 @@ function doGet(e) {
   var token = String((e && e.parameter && e.parameter.token) || '');
   if (action === 'list') {
     return handleList_(e.parameter.category, token, e.parameter.offset, e.parameter.keyword);
+  }
+  if (action === 'search') {
+    return handleSearch_(token, e.parameter.offset, e.parameter.keyword);
   }
   if (action === 'categories') {
     return handleCategories_(token);
@@ -124,65 +128,106 @@ function handleList_(category, token, offsetParam, keywordParam) {
       throw new Error('不明なカテゴリです: ' + category);
     }
 
-    // offset の検証（未指定・不正値は 0 = 先頭ページとして扱う）
-    var offset = parseInt(offsetParam, 10);
-    if (isNaN(offset) || offset < 0) {
-      offset = 0;
-    }
-
-    var keyword = String(keywordParam || '').trim().toLowerCase();
-
-    var sheet = getOrCreateIndexSheet_();
-    var values = sheet.getDataRange().getValues(); // values[0] はヘッダ行
-
-    // Driveファイル列の数式（=HYPERLINK("…/document/d/{fileId}/edit","開く")）を取得し、
-    // 各記事の編集キーとなる fileId を抽出できるようにする。
-    // getValues では数式セルは表示値（"開く"）になり fileId が取れないため、別途 getFormulas で取る。
-    // fileFormulas[k] がシートの (k+2) 行目（＝ values[k+1]）に対応する。
-    var fileFormulas = values.length >= 2
-      ? sheet.getRange(2, INDEX_COL.FILE, values.length - 1, 1).getFormulas()
-      : [];
-
-    var items = [];
-    var matched = 0;   // このカテゴリ・キーワード条件で何件目まで見たか（offsetの読み飛ばし用）
-    var hasMore = false;
-    // 新しい順（末尾の行から）に走査し、offset分を読み飛ばして1ページ分集める
-    for (var i = values.length - 1; i >= 1; i--) {
-      var row = values[i];
-      if (row[INDEX_COL.CATEGORY - 1] !== category) {
-        continue;
-      }
-      var title = row[INDEX_COL.TITLE - 1];
-      var memo = row[INDEX_COL.MEMO - 1] || '';
-      var tagsText = row[INDEX_COL.TAGS - 1] || '';
-      if (keyword && !rowMatchesKeyword_(title, memo, tagsText, keyword)) {
-        continue;
-      }
-      matched++;
-      if (matched <= offset) {
-        continue; // 前のページで返却済み
-      }
-      if (items.length >= LIST_PAGE_SIZE) {
-        hasMore = true; // 1ページ分を超える該当行がまだある
-        break;
-      }
-      var fileFormula = fileFormulas[i - 1] ? fileFormulas[i - 1][0] : '';
-      items.push({
-        savedAt: row[INDEX_COL.SAVED_AT - 1],
-        title: title,
-        url: row[INDEX_COL.URL - 1],
-        memo: memo,
-        tags: splitTagsText_(tagsText),
-        fileId: extractFileIdFromFormula_(fileFormula)
-      });
-    }
+    var offset = normalizeOffset_(offsetParam);
+    var keyword = normalizeKeyword_(keywordParam);
+    var page = collectListItems_(category, keyword, offset);
 
     return jsonResponse_({
-      ok: true, category: category, items: items, offset: offset, hasMore: hasMore
+      ok: true, category: category, items: page.items, offset: offset, hasMore: page.hasMore
     });
   } catch (err) {
     return jsonResponse_({ ok: false, error: String((err && err.message) || err) });
   }
+}
+
+/**
+ * カテゴリを横断して、タイトル・メモ・タグのいずれかにキーワードが部分一致（大文字小文字を
+ * 区別しない）する記事一覧を新しい順に返す（action=search、URLは絞り込み対象外）。
+ * カテゴリ内一覧（handleList_）と同じくLIST_PAGE_SIZE件区切り・offset/hasMoreページング。
+ * 結果には複数カテゴリの記事が混在しうるため、各記事に category を含める。
+ */
+function handleSearch_(token, offsetParam, keywordParam) {
+  try {
+    checkToken_(token);
+
+    var offset = normalizeOffset_(offsetParam);
+    var keyword = normalizeKeyword_(keywordParam);
+    var page = collectListItems_('', keyword, offset);
+
+    return jsonResponse_({
+      ok: true, items: page.items, offset: offset, hasMore: page.hasMore
+    });
+  } catch (err) {
+    return jsonResponse_({ ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+/** offset パラメータを検証する。未指定・不正値は 0（先頭ページ）として扱う。 */
+function normalizeOffset_(offsetParam) {
+  var offset = parseInt(offsetParam, 10);
+  return (isNaN(offset) || offset < 0) ? 0 : offset;
+}
+
+/** keyword パラメータを、比較用に前後空白除去・小文字化して返す。 */
+function normalizeKeyword_(keywordParam) {
+  return String(keywordParam || '').trim().toLowerCase();
+}
+
+/**
+ * インデックスシート（Sheets）を新しい順に走査し、条件に一致する記事を
+ * offset/hasMoreページングして返す共通処理。handleList_（カテゴリ内一覧）と
+ * handleSearch_（カテゴリ横断検索）の両方から使う。
+ * categoryFilter が空文字なら全カテゴリを対象にする（横断検索用）。
+ */
+function collectListItems_(categoryFilter, keyword, offset) {
+  var sheet = getOrCreateIndexSheet_();
+  var values = sheet.getDataRange().getValues(); // values[0] はヘッダ行
+
+  // Driveファイル列の数式（=HYPERLINK("…/document/d/{fileId}/edit","開く")）を取得し、
+  // 各記事の編集キーとなる fileId を抽出できるようにする。
+  // getValues では数式セルは表示値（"開く"）になり fileId が取れないため、別途 getFormulas で取る。
+  // fileFormulas[k] がシートの (k+2) 行目（＝ values[k+1]）に対応する。
+  var fileFormulas = values.length >= 2
+    ? sheet.getRange(2, INDEX_COL.FILE, values.length - 1, 1).getFormulas()
+    : [];
+
+  var items = [];
+  var matched = 0;   // 絞り込み条件（カテゴリ・キーワード）で何件目まで見たか（offsetの読み飛ばし用）
+  var hasMore = false;
+  // 新しい順（末尾の行から）に走査し、offset分を読み飛ばして1ページ分集める
+  for (var i = values.length - 1; i >= 1; i--) {
+    var row = values[i];
+    var category = row[INDEX_COL.CATEGORY - 1];
+    if (categoryFilter && category !== categoryFilter) {
+      continue;
+    }
+    var title = row[INDEX_COL.TITLE - 1];
+    var memo = row[INDEX_COL.MEMO - 1] || '';
+    var tagsText = row[INDEX_COL.TAGS - 1] || '';
+    if (keyword && !rowMatchesKeyword_(title, memo, tagsText, keyword)) {
+      continue;
+    }
+    matched++;
+    if (matched <= offset) {
+      continue; // 前のページで返却済み
+    }
+    if (items.length >= LIST_PAGE_SIZE) {
+      hasMore = true; // 1ページ分を超える該当行がまだある
+      break;
+    }
+    var fileFormula = fileFormulas[i - 1] ? fileFormulas[i - 1][0] : '';
+    items.push({
+      savedAt: row[INDEX_COL.SAVED_AT - 1],
+      category: category,
+      title: title,
+      url: row[INDEX_COL.URL - 1],
+      memo: memo,
+      tags: splitTagsText_(tagsText),
+      fileId: extractFileIdFromFormula_(fileFormula)
+    });
+  }
+
+  return { items: items, hasMore: hasMore };
 }
 
 /**
