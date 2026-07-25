@@ -110,10 +110,56 @@ Androidの共有シート（Web Share Target）はPCでは機能しないため�
 - **削除の挙動**: カテゴリ選択肢から外れるだけで、Drive上の保存済みファイルやSheetsの過去の行は削除されません（非破壊）
 - **改名は未対応**: 名前を変えたい場合は「新しい名前を追加」→「古い名前を削除」で代用してください（過去のデータは旧カテゴリ名のまま残ります。Driveのフォルダ名は手動でリネームすれば追随できます）
 
+## Vercel Serverless Function（Claude検索用API）
+
+Claude.ai（`web_fetch`）から、GASの記事検索API（一覧・横断検索・カテゴリ取得）を直接叩けるようにするための中継APIです。GASのWebアプリURLと合言葉(`SHARED_TOKEN`)をClaude.ai側に渡さずに済むよう、Vercel側の環境変数として保持し、リクエストのたびにサーバー側で付与してGASへ転送します。
+
+### 環境変数（Vercelダッシュボードで設定）
+
+値そのものはこのリポジトリ・READMEには記載しません。
+
+| 変数名 | 用途 |
+|---|---|
+| `GAS_URL` | GAS WebアプリのURL（[Step 1](#step-1-gasバックエンドのデプロイ)でデプロイしたexec URL） |
+| `SHARED_TOKEN` | GAS側の `SHARED_TOKEN`（スクリプトプロパティ）と同じ合言葉 |
+
+**設定手順**
+1. Vercelのプロジェクトダッシュボード → 「Settings」→「Environment Variables」
+2. 「Add New」で `GAS_URL` と `SHARED_TOKEN` をそれぞれ追加（Value欄に実際の値を入力、対象環境は Production 等必要な範囲を選択）
+3. 保存後、「Deployments」タブから最新デプロイの「Redeploy」を実行（環境変数は次回デプロイから反映されるため）
+
+### API仕様
+
+```
+GET /api/knowledge?action=<list|search|categories>&keyword=<任意>&category=<任意>&offset=<任意>
+```
+
+GASの `doGet` にあるクエリパラメータをそのまま転送するだけの中継です（`token` はクライアントから受け取らず、サーバー側で付与）。
+
+| パラメータ | 必須 | 説明 |
+|---|---|---|
+| `action` | ○ | `list`（カテゴリ内一覧）／`search`（カテゴリ横断キーワード検索）／`categories`（カテゴリ・タグ一覧取得） |
+| `keyword` | - | `list`／`search` の絞り込みキーワード（タイトル・メモ・タグの部分一致） |
+| `category` | `list`のみ必須 | 対象カテゴリ名 |
+| `offset` | - | ページング開始位置（`list`／`search` のレスポンスの `hasMore`/`offset` に従って次ページ取得に使う） |
+
+レスポンスはGASの応答（`{ ok: true, ... }` / `{ ok: false, error: ... }`）をそのまま透過します。
+
+**動作確認URL例**（`<vercelのデプロイURL>` は実際のものに置き換え。token は含めません）
+```
+https://<vercelのデプロイURL>/api/knowledge?action=categories
+https://<vercelのデプロイURL>/api/knowledge?action=search&keyword=Docker
+```
+
+エラー時のレスポンス:
+- 環境変数(`GAS_URL`/`SHARED_TOKEN`)未設定: HTTP 500
+- GASへの通信自体に失敗（ネットワークエラー等）: HTTP 502
+- GAS側が業務エラー（`ok: false`）を返した場合: HTTP 200 のまま `{ ok: false, error: ... }` を透過（GASのWebアプリはHTTPステータスを持たず常に200で応答するため）
+
 ## 開発
 
 ```powershell
-npm test        # 自動テスト（GASロジック107件・クライアントロジック35件）
+npm test        # 自動テスト（GASロジック110件・クライアントロジック53件・中継API7件）
 npm run dev     # ローカルサーバ起動（http://localhost:8765/）
 npm run icons   # アイコンPNGの再生成
 ```
