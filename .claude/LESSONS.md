@@ -59,3 +59,9 @@
 - 症状: Grep のコンテキスト出力で `gas/Code.gs` の「共有時のURL（短縮/リダイレクト元）」のスラッシュがバックスラッシュに見え、buildMarkdown_ と extractDocOriginalUrl_ の往復不一致(編集時に共有時URL行が消えるバグ)と誤診しかけた。
 - 根本原因: ツールのコンテキスト表示のアーティファクトで、実ファイルはスラッシュで一致していた(証拠: Read で該当行を直接確認、`node -e` でJS文字列の評価も確認)。
 - 教訓: ツール出力(grep・スクリーンショット等)で「文字レベルの不一致」を見つけたら、修復に入る前に必ず Read で実ファイルの該当行を確認して本物か裁定する。ヘッドレスChromeの教訓(2026-07-12)と同型: 観測装置自体を疑う工程を挟む。
+
+## 2026-07-26 git add → commit の間に、環境側の自動処理でコミット・push・PR作成が先に完了していた
+
+- 症状: `api/knowledge.js` 一式を `git add` でステージ後、自分で `git commit -m "..."` を実行したところ `nothing to commit, working tree clean` で失敗した。調べると、指定したメッセージとは異なる（ただし内容は一致する）コミットが既にHEADに存在し、`origin` にもpush済み、`gh pr list` でPR #11も既にopenだった。
+- 根本原因: 断定できず(証拠不足)。VSCode拡張環境で動作しているこのセッションでは、ステージされた変更に対して自分の`git commit`実行前に、何らかの自動処理（VSCode Git拡張のsmart commit/auto-sync、または別のエージェント連携）がコミット・push・PR作成まで完了させたと推測されるが、直接の証拠(ログ等)は確認していないため「寄与は未確認」。
+- 教訓: `git commit` が `nothing to commit` で失敗したら、直前に自分がstageした内容が消えたのではなく既に誰か(何か)がコミット済みの可能性を疑い、`git log -1`・`git status`(originとの同期状態)・`gh pr list` で現状を確認してから次の手を決める。特にPR作成が依頼に含まれるタスクでは、`gh pr create` を実行する前に `gh pr list --head <branch>` で既存PRの有無を確認する。
