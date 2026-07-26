@@ -156,6 +156,17 @@ https://<vercelのデプロイURL>/api/knowledge?action=search&keyword=Docker
 - GASへの通信自体に失敗（ネットワークエラー等）: HTTP 502
 - GAS側が業務エラー（`ok: false`）を返した場合: HTTP 200 のまま `{ ok: false, error: ... }` を透過（GASのWebアプリはHTTPステータスを持たず常に200で応答するため）
 
+### 既知の制約: Claude.aiのweb_fetchが検索を正しく呼べないことがある
+
+このAPI自体は`curl`等での直接アクセスでは常に正常に動作する（`action`/`keyword`によるフィルタも正しく効く）ことを確認済みだが、**Claude.ai（claude.aiのチャット、`web_fetch`ツール経由）から使うと、意図したクエリ（`action=search&keyword=...`）が実際にはサーバーへ届かず、実在する記事が「見つからない」と誤報告されることが繰り返し確認されている**。
+
+原因の切り分け（2026-07-26実施）:
+- Vercelの「Logs」（Function Logs）で実際に届いたリクエストを確認したところ、`web_fetch`からの通信は`action=list`（`category`なし）になっていた、あるいはリクエスト自体が全く記録されない、という事象を複数回observed
+- 同じ検索を`curl`で直接叩くと毎回正しい結果が返ることを都度確認済み（コード・データ側の問題ではない）
+- Claude.aiの個人設定（カスタム指示）で「`action=search`を使うこと、`list`は使わないこと」を明記しても改善しなかった
+
+**回避策**: Claude.ai（web_fetch経由）での検索がうまくいかない場合は、Claude Code（このリポジトリを開いているセッション）でBashツール経由の`curl`で直接叩いてもらう方が確実。詳細な経緯は `.claude/LESSONS.md`（2026-07-26のエントリ）を参照。
+
 ## 開発
 
 ```powershell
