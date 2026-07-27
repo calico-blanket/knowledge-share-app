@@ -82,10 +82,10 @@ function doGet(e) {
   var action = e && e.parameter && e.parameter.action;
   var token = String((e && e.parameter && e.parameter.token) || '');
   if (action === 'list') {
-    return handleList_(e.parameter.category, token, e.parameter.offset, e.parameter.keyword);
+    return handleList_(e.parameter.category, token, e.parameter.offset, e.parameter.keyword, e.parameter.tags);
   }
   if (action === 'search') {
-    return handleSearch_(token, e.parameter.offset, e.parameter.keyword);
+    return handleSearch_(token, e.parameter.offset, e.parameter.keyword, e.parameter.tags);
   }
   if (action === 'categories') {
     return handleCategories_(token);
@@ -118,10 +118,12 @@ function handleCategories_(token) {
  * 指定カテゴリの保存済み記事一覧を、検索用インデックス（Sheets）から新しい順に返す。
  * keyword を指定すると、タイトル・メモ・タグのいずれかに部分一致（大文字小文字を
  * 区別しない）する記事だけに絞り込んでからページングする（URLは絞り込み対象外）。
+ * tags（カンマ区切り）を指定すると、そのすべてのタグを持つ記事だけに絞り込む（AND条件）。
+ * keyword と tags は併用でき、その場合は両方の条件を満たす記事のみが対象になる。
  * 一度に返すのは LIST_PAGE_SIZE 件まで。offset（絞り込み後・新しい順で何件目から）を
  * 指定すると続きのページを返し、まだ続きがある場合はレスポンスに hasMore: true を含める。
  */
-function handleList_(category, token, offsetParam, keywordParam) {
+function handleList_(category, token, offsetParam, keywordParam, tagsParam) {
   try {
     checkToken_(token);
     if (!category || getCategories_().indexOf(category) === -1) {
@@ -130,7 +132,8 @@ function handleList_(category, token, offsetParam, keywordParam) {
 
     var offset = normalizeOffset_(offsetParam);
     var keyword = normalizeKeyword_(keywordParam);
-    var page = collectListItems_(category, keyword, offset);
+    var tags = normalizeTagsParam_(tagsParam);
+    var page = collectListItems_(category, keyword, tags, offset);
 
     return jsonResponse_({
       ok: true, category: category, items: page.items, offset: offset, hasMore: page.hasMore
@@ -143,16 +146,18 @@ function handleList_(category, token, offsetParam, keywordParam) {
 /**
  * カテゴリを横断して、タイトル・メモ・タグのいずれかにキーワードが部分一致（大文字小文字を
  * 区別しない）する記事一覧を新しい順に返す（action=search、URLは絞り込み対象外）。
+ * tags（カンマ区切り）を指定すると、そのすべてのタグを持つ記事だけに絞り込む（AND条件、keywordと併用可）。
  * カテゴリ内一覧（handleList_）と同じくLIST_PAGE_SIZE件区切り・offset/hasMoreページング。
  * 結果には複数カテゴリの記事が混在しうるため、各記事に category を含める。
  */
-function handleSearch_(token, offsetParam, keywordParam) {
+function handleSearch_(token, offsetParam, keywordParam, tagsParam) {
   try {
     checkToken_(token);
 
     var offset = normalizeOffset_(offsetParam);
     var keyword = normalizeKeyword_(keywordParam);
-    var page = collectListItems_('', keyword, offset);
+    var tags = normalizeTagsParam_(tagsParam);
+    var page = collectListItems_('', keyword, tags, offset);
 
     return jsonResponse_({
       ok: true, items: page.items, offset: offset, hasMore: page.hasMore
@@ -174,12 +179,24 @@ function normalizeKeyword_(keywordParam) {
 }
 
 /**
+ * tags パラメータ（カンマ区切り文字列）を、前後空白除去済み・空文字除外済みの
+ * 文字列配列に正規化する純粋関数。未指定なら空配列を返す。
+ */
+function normalizeTagsParam_(tagsParam) {
+  return String(tagsParam || '')
+    .split(',')
+    .map(function (tag) { return tag.trim(); })
+    .filter(function (tag) { return !!tag; });
+}
+
+/**
  * インデックスシート（Sheets）を新しい順に走査し、条件に一致する記事を
  * offset/hasMoreページングして返す共通処理。handleList_（カテゴリ内一覧）と
  * handleSearch_（カテゴリ横断検索）の両方から使う。
  * categoryFilter が空文字なら全カテゴリを対象にする（横断検索用）。
+ * tagsFilter（配列）を指定すると、そのすべてのタグを持つ記事だけに絞り込む（AND条件）。
  */
-function collectListItems_(categoryFilter, keyword, offset) {
+function collectListItems_(categoryFilter, keyword, tagsFilter, offset) {
   var sheet = getOrCreateIndexSheet_();
   var values = sheet.getDataRange().getValues(); // values[0] はヘッダ行
 
@@ -205,6 +222,9 @@ function collectListItems_(categoryFilter, keyword, offset) {
     var memo = row[INDEX_COL.MEMO - 1] || '';
     var tagsText = row[INDEX_COL.TAGS - 1] || '';
     if (keyword && !rowMatchesKeyword_(title, memo, tagsText, keyword)) {
+      continue;
+    }
+    if (tagsFilter && tagsFilter.length && !rowMatchesAllTags_(tagsText, tagsFilter)) {
       continue;
     }
     matched++;
@@ -238,6 +258,17 @@ function rowMatchesKeyword_(title, memo, tagsText, lowerKeyword) {
   return String(title).toLowerCase().indexOf(lowerKeyword) !== -1
     || String(memo).toLowerCase().indexOf(lowerKeyword) !== -1
     || String(tagsText).toLowerCase().indexOf(lowerKeyword) !== -1;
+}
+
+/**
+ * 記事のタグ文字列が、指定されたタグすべてを含むか（AND条件）を判定する純粋関数。
+ * requiredTags が空配列の場合は常に true（絞り込みなし）を返す。
+ */
+function rowMatchesAllTags_(tagsText, requiredTags) {
+  var rowTags = splitTagsText_(tagsText);
+  return requiredTags.every(function (required) {
+    return rowTags.indexOf(required) !== -1;
+  });
 }
 
 /** インデックスシートのタグ列（", " 区切り文字列）を、前後空白除去済みの配列に戻す */
@@ -325,6 +356,12 @@ function handleSave_(body) {
   // ステップ2: ページのタイトルを取得（失敗時はタイトル=URL）
   var title = fetchPageTitle_(resolvedUrl);
 
+  // ステップ2.5: Xの投稿ページは本文がそのままタイトル化されて長くなりがちなため、
+  // 100文字を超える場合は切り詰める（プロフィールページ等の投稿以外のURLは対象外）
+  if (isXPost_(resolvedUrl) && title.length > 100) {
+    title = title.slice(0, 100) + '…';
+  }
+
   // ステップ3: メモがタイトルと重複している場合は捨てる
   // （Android共有時に「タイトル文字列」がそのままメモ扱いで送られてくることが多く、
   //   タイトルと同じ内容が二重表示されるのを防ぐ）
@@ -384,6 +421,15 @@ function normalizeTagsInput_(raw) {
   return raw
     .map(function (tag) { return String(tag || '').trim(); })
     .filter(function (tag) { return !!tag; });
+}
+
+/**
+ * URLがX（Twitter）の個別投稿ページかどうかを判定する純粋関数。
+ * x.com または twitter.com の "/ユーザー名/status/数字" パターンに一致するものだけを対象とし、
+ * プロフィールページ等（/status/数字 を含まないURL）は対象外とする。
+ */
+function isXPost_(url) {
+  return /^https?:\/\/(www\.)?(x\.com|twitter\.com)\/[^\/?#]+\/status\/\d+/i.test(String(url || ''));
 }
 
 /**
