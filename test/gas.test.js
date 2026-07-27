@@ -271,16 +271,16 @@ function callDoPost(context, bodyObj) {
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=list&category=...&token=...&offset=...&keyword=... 相当のパラメータで呼び、レスポンスJSONを返す */
-function callDoGetList(context, category, token, offset, keyword) {
-  const e = { parameter: { action: 'list', category: category, token: token, offset: offset, keyword: keyword } };
+/** doGet を ?action=list&category=...&token=...&offset=...&keyword=...&tags=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetList(context, category, token, offset, keyword, tags) {
+  const e = { parameter: { action: 'list', category: category, token: token, offset: offset, keyword: keyword, tags: tags } };
   const output = context.doGet(e);
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=search&keyword=...&token=...&offset=... 相当のパラメータで呼び、レスポンスJSONを返す */
-function callDoGetSearch(context, keyword, token, offset) {
-  const e = { parameter: { action: 'search', keyword: keyword, token: token, offset: offset } };
+/** doGet を ?action=search&keyword=...&token=...&offset=...&tags=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetSearch(context, keyword, token, offset, tags) {
+  const e = { parameter: { action: 'search', keyword: keyword, token: token, offset: offset, tags: tags } };
   const output = context.doGet(e);
   return JSON.parse(output.getContent());
 }
@@ -628,6 +628,75 @@ test('キーワード検索: 絞り込み後の件数でoffset/hasMoreページ�
   const page1 = callDoGetList(context, 'PC系', undefined, undefined, 'ヒットワード');
   assert.strictEqual(page1.items.length, 3, '該当3件のみが対象（非該当1件は除外）');
   assert.strictEqual(page1.hasMore, false);
+});
+
+// ---- 一覧API: タグ複数選択（AND条件） --------------------------------
+
+test('タグ絞り込み: 単一タグ指定でそのタグを持つ記事のみ返す', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'Claude' });
+  callDoPost(context, { action: 'addTag', name: 'GitHub' });
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系', tags: ['Claude'] });
+  callDoPost(context, { url: 'https://example.com/b', category: 'PC系', tags: ['GitHub'] });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, undefined, 'Claude');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].url, 'https://example.com/a');
+});
+
+test('タグ絞り込み: 複数タグ指定はAND条件（両方のタグを持つ記事のみ返す）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'Claude' });
+  callDoPost(context, { action: 'addTag', name: 'GitHub' });
+  callDoPost(context, { url: 'https://example.com/both', category: 'PC系', tags: ['Claude', 'GitHub'] });
+  callDoPost(context, { url: 'https://example.com/onlyClaude', category: 'PC系', tags: ['Claude'] });
+  callDoPost(context, { url: 'https://example.com/onlyGitHub', category: 'PC系', tags: ['GitHub'] });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, undefined, 'Claude,GitHub');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].url, 'https://example.com/both');
+});
+
+test('タグ絞り込み: キーワード検索と併用するとAND条件で両方を満たす記事のみ返す', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'Claude' });
+  callDoPost(context, {
+    url: 'https://example.com/match', category: 'PC系', memo: '重要な備忘録', tags: ['Claude']
+  });
+  callDoPost(context, {
+    url: 'https://example.com/tagonly', category: 'PC系', memo: '関係ないメモ', tags: ['Claude']
+  });
+
+  const result = callDoGetList(context, 'PC系', undefined, undefined, '備忘録', 'Claude');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].url, 'https://example.com/match');
+});
+
+test('タグ絞り込み: 未指定・空文字は絞り込まない（全件返す）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/x1', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/x2', category: 'PC系' });
+
+  const withUndefined = callDoGetList(context, 'PC系');
+  const withEmpty = callDoGetList(context, 'PC系', undefined, undefined, undefined, '   ');
+  assert.strictEqual(withUndefined.items.length, 2);
+  assert.strictEqual(withEmpty.items.length, 2, '空白のみのtagsも未指定扱い');
+});
+
+test('タグ絞り込み: カテゴリ横断検索(action=search)でもAND条件で絞り込める', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'Claude' });
+  callDoPost(context, { action: 'addTag', name: 'GitHub' });
+  callDoPost(context, { url: 'https://example.com/both', category: 'PC系', tags: ['Claude', 'GitHub'] });
+  callDoPost(context, { url: 'https://example.com/onlyClaude', category: 'DTP系', tags: ['Claude'] });
+
+  const result = callDoGetSearch(context, undefined, undefined, undefined, 'Claude,GitHub');
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.items.length, 1);
+  assert.strictEqual(result.items[0].url, 'https://example.com/both');
 });
 
 test('escapeFormulaString_: ダブルクォートが二重化される（数式インジェクション対策）', () => {
@@ -983,6 +1052,76 @@ test('doPost: 短縮/リダイレクトURLは実URLに解決されてからSheet
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.title, '実記事タイトル');
   assert.strictEqual(sheet._rows[1][3], 'https://real.example/article', 'Sheets側のURL列は解決後のURL');
+});
+
+// ---- Xポストのタイトル切り詰め ----------------------------------
+
+test('isXPost_: x.com の投稿URL(status付き)はXポストと判定される', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isXPost_('https://x.com/someuser/status/1234567890'), true);
+});
+
+test('isXPost_: twitter.com の投稿URL(status付き)もXポストと判定される', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isXPost_('https://twitter.com/someuser/status/1234567890'), true);
+});
+
+test('isXPost_: www.付きのホスト名でもXポストと判定される', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isXPost_('https://www.x.com/someuser/status/1234567890'), true);
+});
+
+test('isXPost_: プロフィールページ(statusを含まない)はXポストではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isXPost_('https://x.com/someuser'), false);
+});
+
+test('isXPost_: statusの後が数字以外ならXポストではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isXPost_('https://x.com/someuser/status/abc'), false);
+});
+
+test('isXPost_: X/Twitter以外のドメインはXポストではない', () => {
+  const { context } = loadGasScript();
+  assert.strictEqual(context.isXPost_('https://example.com/someuser/status/1234567890'), false);
+});
+
+test('doPost: Xポストで100文字を超えるタイトルは先頭100文字+…に切り詰められる', () => {
+  const longTitle = 'あ'.repeat(101);
+  const { context, sheet } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>' + longTitle + '</title>' })
+  });
+
+  const result = callDoPost(context, {
+    url: 'https://x.com/someuser/status/1234567890',
+    category: 'PC系'
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.title, 'あ'.repeat(100) + '…');
+  assert.strictEqual(sheet._rows[1][2], 'あ'.repeat(100) + '…', 'Sheets側のタイトル列も切り詰め後');
+});
+
+test('doPost: Xポストでもタイトルがちょうど100文字なら切り詰めない', () => {
+  const title100 = 'あ'.repeat(100);
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>' + title100 + '</title>' })
+  });
+
+  const result = callDoPost(context, {
+    url: 'https://x.com/someuser/status/1234567890',
+    category: 'PC系'
+  });
+  assert.strictEqual(result.title, title100);
+});
+
+test('doPost: Xポストでなければ100文字を超えるタイトルでも切り詰めない', () => {
+  const longTitle = 'あ'.repeat(101);
+  const { context } = loadGasScript({
+    fetchImpl: () => makeFetchResponse({ body: '<title>' + longTitle + '</title>' })
+  });
+
+  const result = callDoPost(context, { url: 'https://example.com/article', category: 'PC系' });
+  assert.strictEqual(result.title, longTitle);
 });
 
 // ---- メモ重複排除（タイトルと同一のメモを捨てる） -------------------
@@ -1530,7 +1669,8 @@ test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（�
     'rebuildDocContent_', 'extractDocOriginalUrl_', 'extractDocBodyText_',
     'getTags_', 'saveTags_', 'sanitizeTagName_', 'normalizeTagsInput_',
     'handleAddTag_', 'handleRemoveTag_', 'handleReorderTags_', 'fetchPageTitle_',
-    'handleSearch_', 'collectListItems_', 'normalizeOffset_', 'normalizeKeyword_'
+    'handleSearch_', 'collectListItems_', 'normalizeOffset_', 'normalizeKeyword_',
+    'isXPost_', 'normalizeTagsParam_', 'rowMatchesAllTags_'
   ];
   for (const fn of names) {
     const definitions = source.match(new RegExp('function ' + fn + '\\(', 'g')) || [];

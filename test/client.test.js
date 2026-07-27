@@ -390,7 +390,7 @@ test('検索UI: 一覧画面に検索入力欄があり、input時にscheduleLis
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   assert.match(html, /id="listSearchInput"/, '検索入力欄が存在すること');
   // listItemsContainer より前（タイトルの直後）に配置されていること
-  const view = html.match(/<div id="listItemsView"[\s\S]*?<\/div>/);
+  const view = html.match(/<div id="listItemsView"[\s\S]*?<!-- ビュー4b:/);
   assert.ok(view, 'listItemsViewが存在すること');
   assert.ok(
     view[0].indexOf('id="listSearchInput"') < view[0].indexOf('id="listItemsContainer"'),
@@ -414,7 +414,8 @@ test('検索UI: runListSearchはkeywordを付けてGASへ問い合わせ、結�
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/async function runListSearch\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'runListSearch関数が存在すること');
-  assert.match(m[1], /gasGet\('list', \{ category: category, offset: 0, keyword: keyword \}\)/, 'keywordを付けて検索すること');
+  assert.match(m[1], /var params = \{ category: category, offset: 0, keyword: keyword \}/, 'keywordを付けて検索すること');
+  assert.match(m[1], /gasGet\('list', params\)/, 'GASへ問い合わせること');
   assert.match(m[1], /state\.listKeyword = keyword/, '検索中のキーワードをstateへ保持すること');
   assert.match(m[1], /await openListItemsView\(category\)/, 'キーワードが空になったら通常の一覧表示へ戻ること');
 });
@@ -469,7 +470,8 @@ test('横断検索UI: runGlobalSearchはcategory無しでGASのsearchアクシ�
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/async function runGlobalSearch\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'runGlobalSearch関数が存在すること');
-  assert.match(m[1], /gasGet\('search', \{ offset: 0, keyword: keyword \}\)/, 'categoryを指定せずsearchアクションを呼ぶこと');
+  assert.match(m[1], /var params = \{ offset: 0, keyword: keyword \}/, 'categoryを指定せずsearchアクションを呼ぶこと');
+  assert.match(m[1], /gasGet\('search', params\)/, 'GASへ問い合わせること');
   assert.match(m[1], /state\.searchKeyword = keyword/, '検索中のキーワードをstateへ保持すること');
 });
 
@@ -478,7 +480,8 @@ test('横断検索UI: 「さらに読み込む」は検索中のキーワード�
   const m = html.match(/async function loadMoreSearchItems\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'loadMoreSearchItems関数が存在すること');
   assert.match(m[1], /var keyword = state\.searchKeyword/, '検索中のキーワードを引き継ぐこと');
-  assert.match(m[1], /gasGet\('search', \{ offset: state\.searchItems\.length, keyword: keyword \}\)/);
+  assert.match(m[1], /var params = \{ offset: state\.searchItems\.length, keyword: keyword \}/);
+  assert.match(m[1], /gasGet\('search', params\)/);
 });
 
 test('横断検索UI: renderSearchItemsは各記事にカテゴリ名を表示し、編集ボタンは出さない', () => {
@@ -497,4 +500,73 @@ test('カテゴリ・タグ管理: 設定画面を開くと両方のセクショ
   assert.match(m[1], /tagManageSection/);
   assert.match(m[1], /renderCategoryManageList\(\)/);
   assert.match(m[1], /renderTagManageList\(\)/);
+});
+
+// ---- 検索画面のタグ複数選択（AND条件で絞り込み） ------------------------
+
+test('タグ複数選択UI: 一覧・横断検索の両画面にタグフィルター用のDOM idがある', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /id="listTagFilterGrid"/, '一覧画面にタグフィルター用のコンテナがあること');
+  assert.match(html, /id="searchTagFilterGrid"/, '横断検索画面にタグフィルター用のコンテナがあること');
+});
+
+test('タグ複数選択UI: renderTagFilterButtonsは選択中タグをハイライトし、タップでonToggleを呼ぶ', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function renderTagFilterButtons\(containerId, selectedTags, onToggle\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderTagFilterButtons関数が存在すること');
+  assert.match(m[1], /tag-filter-button-selected/, '選択中タグをハイライトすること');
+  assert.match(m[1], /onToggle\(tag\)/, 'タップでonToggleを呼ぶこと');
+});
+
+test('タグ複数選択UI: toggleListFilterTagはstate.listFilterTagsを更新して検索を再実行する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function toggleListFilterTag\(tag\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'toggleListFilterTag関数が存在すること');
+  assert.match(m[1], /state\.listFilterTags/, 'state.listFilterTagsを更新すること');
+  assert.match(m[1], /runListSearch\(\)/, '選択変更のたびに検索を再実行すること');
+});
+
+test('タグ複数選択UI: toggleSearchFilterTagはstate.searchFilterTagsを更新して横断検索を再実行する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function toggleSearchFilterTag\(tag\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'toggleSearchFilterTag関数が存在すること');
+  assert.match(m[1], /state\.searchFilterTags/, 'state.searchFilterTagsを更新すること');
+  assert.match(m[1], /runGlobalSearch\(\)/, '選択変更のたびに横断検索を再実行すること');
+});
+
+test('タグ複数選択UI: runListSearchは選択中タグをAND条件のtagsパラメータとしてGASへ渡す', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function runListSearch\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'runListSearch関数が存在すること');
+  assert.match(m[1], /filterTags\.length.*params\.tags = buildTagsParam\(filterTags\)/, 'タグ選択時はtagsパラメータを付与すること');
+  assert.match(m[1], /!keyword && !filterTags\.length/, 'キーワード・タグどちらも無ければ通常表示に戻ること');
+});
+
+test('タグ複数選択UI: runGlobalSearchは選択中タグをAND条件のtagsパラメータとしてGASへ渡す', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function runGlobalSearch\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'runGlobalSearch関数が存在すること');
+  assert.match(m[1], /filterTags\.length.*params\.tags = buildTagsParam\(filterTags\)/, 'タグ選択時はtagsパラメータを付与すること');
+});
+
+test('タグ複数選択UI: buildTagsParamはタグ配列をカンマ区切り文字列に変換する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const context = { document: { getElementById: () => ({}) } };
+  const m = html.match(/function buildTagsParam\(tags\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'buildTagsParam関数が存在すること');
+  vm.createContext(context);
+  vm.runInContext('function buildTagsParam(tags) {' + m[1] + '}', context);
+  assert.strictEqual(context.buildTagsParam(['Claude', 'GitHub']), 'Claude,GitHub');
+  assert.strictEqual(context.buildTagsParam(['単一タグ']), '単一タグ');
+});
+
+test('タグ複数選択UI: openListItemsView・openSearchViewはタグ選択状態もリセットする', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const listOpen = html.match(/async function openListItemsView\(category\) \{([\s\S]*?)\n    \}/);
+  assert.ok(listOpen, 'openListItemsView関数が存在すること');
+  assert.match(listOpen[1], /state\.listFilterTags = \[\]/, 'カテゴリを開くたびにタグ選択をリセットすること');
+
+  const searchOpen = html.match(/function openSearchView\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(searchOpen, 'openSearchView関数が存在すること');
+  assert.match(searchOpen[1], /state\.searchFilterTags = \[\]/, '検索ビューを開くたびにタグ選択をリセットすること');
 });
