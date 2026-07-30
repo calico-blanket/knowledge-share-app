@@ -311,6 +311,19 @@
     .list-item-date { font-size: 12px; color: #8a90a0; margin-bottom: 4px; }
     .list-item-title { font-size: 15px; font-weight: 600; color: #3949ab; line-height: 1.4; }
     .list-item-memo { font-size: 13px; color: #5a6070; margin-top: 4px; }
+    /* 一覧内タグバッジ: カテゴリボタン(52px)・タグ選択UI(44px/14px)より弱い階層の付随情報。
+       操作を持たないため min-height を設けず、枠も1pxで装飾を弱くする */
+    .list-item-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .list-item-tag-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      border: 1px solid #d7dae3;
+      background: #f4f5f8;
+      font-size: 11px;
+      font-weight: 600;
+      color: #5a6070;
+    }
     .empty-state { font-size: 14px; color: #8a90a0; text-align: center; padding: 32px 0; }
 
     /* 送信中・完了・エラーの状態表示 */
@@ -1210,6 +1223,18 @@
         title.textContent = item.title;
         link.appendChild(title);
 
+        if (item.tags && item.tags.length) {
+          var tagsRow = document.createElement('div');
+          tagsRow.className = 'list-item-tags';
+          item.tags.forEach(function (tag) {
+            var badge = document.createElement('span');
+            badge.className = 'list-item-tag-badge';
+            badge.textContent = tag;
+            tagsRow.appendChild(badge);
+          });
+          link.appendChild(tagsRow);
+        }
+
         if (item.memo) {
           var memo = document.createElement('div');
           memo.className = 'list-item-memo';
@@ -1374,6 +1399,18 @@
         title.className = 'list-item-title';
         title.textContent = item.title;
         link.appendChild(title);
+
+        if (item.tags && item.tags.length) {
+          var tagsRow = document.createElement('div');
+          tagsRow.className = 'list-item-tags';
+          item.tags.forEach(function (tag) {
+            var badge = document.createElement('span');
+            badge.className = 'list-item-tag-badge';
+            badge.textContent = tag;
+            tagsRow.appendChild(badge);
+          });
+          link.appendChild(tagsRow);
+        }
 
         if (item.memo) {
           var memo = document.createElement('div');
