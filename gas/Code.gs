@@ -58,8 +58,10 @@ var TIME_ZONE = 'Asia/Tokyo';
 // スプレッドシートIDをスクリプトプロパティに保持する必要はなく、
 // SpreadsheetApp.getActiveSpreadsheet() で自分自身（バインド先）を直接参照する。
 var INDEX_SHEET_NAME = 'ナレッジ一覧';
-var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル', 'タグ'];
-var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5, FILE: 6, TAGS: 7 };
+// ID列: 各行を一意特定するUUID。新規保存ではDocsを作らずDriveファイル列が空のため、
+// 編集・削除のキーとしてfileIdの代わりに使う（既存Docs記事はfileIdでも特定できる）
+var INDEX_HEADER = ['日時', 'カテゴリ', 'タイトル', 'URL', 'メモ', 'Driveファイル', 'タグ', 'ID'];
+var INDEX_COL = { SAVED_AT: 1, CATEGORY: 2, TITLE: 3, URL: 4, MEMO: 5, FILE: 6, TAGS: 7, ID: 8 };
 
 // 一覧APIで一度に返す件数（1ページ分）。
 // 件数が増えてもレスポンスが重くならないよう50件で区切り、
@@ -237,6 +239,9 @@ function collectListItems_(categoryFilter, keyword, tagsFilter, offset) {
     }
     var fileFormula = fileFormulas[i - 1] ? fileFormulas[i - 1][0] : '';
     items.push({
+      // id: 編集・削除のキー（マイグレーション済みなら全行に入っている）。
+      // fileId は既存Docs記事の互換用に残す（新規保存の記事では空文字）。
+      id: String(row[INDEX_COL.ID - 1] == null ? '' : row[INDEX_COL.ID - 1]).trim(),
       savedAt: row[INDEX_COL.SAVED_AT - 1],
       category: category,
       title: title,
@@ -284,7 +289,8 @@ function splitTagsText_(tagsText) {
  *   - addCategory      : { name } をカテゴリ一覧に追加
  *   - removeCategory   : { name } をカテゴリ一覧から削除（保存済みデータは残す）
  *   - reorderCategories: { categories } の順にカテゴリの並び順を変更
- *   - update           : { fileId, title, url, memo? } 保存済み記事の内容を編集
+ *   - update           : { id | fileId, title, url, memo? } 保存済み記事の内容を編集
+ *                        （id優先。fileIdのみ指定時は既存Googleドキュメントの本文も更新する）
  *   - addTag           : { name } をタグ一覧に追加
  *   - removeTag        : { name } をタグ一覧から削除（保存済みデータは残す）
  *   - reorderTags      : { tags } の順にタグの並び順を変更
@@ -908,17 +914,42 @@ function buildMarkdown_(title, url, savedAt, category, memo, bodyText, originalU
  * getActiveSpreadsheet() で自分自身（バインド先）を直接参照する
  * （openByIdでの外部参照・IDのスクリプトプロパティ保持は不要）。
  * シートが空（初回バインド直後等）ならヘッダー行を書き込んで初期化する。
- * 列追加前から運用しているシート（「タグ」ヘッダーが無い）は、ヘッダーだけ補完する。
+ * 列追加前から運用しているシート（「タグ」「ID」ヘッダーが無い）は、ヘッダーを補完し、
+ * ID未付与のデータ行にはUUIDを埋めるマイグレーションを行う。
  */
 function getOrCreateIndexSheet_() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(INDEX_HEADER);
     sheet.setFrozenRows(1);
-  } else if (!sheet.getRange(1, INDEX_COL.TAGS).getValue()) {
+    return sheet;
+  }
+  if (!sheet.getRange(1, INDEX_COL.TAGS).getValue()) {
     sheet.getRange(1, INDEX_COL.TAGS).setValue(INDEX_HEADER[INDEX_COL.TAGS - 1]);
   }
+  if (!sheet.getRange(1, INDEX_COL.ID).getValue()) {
+    sheet.getRange(1, INDEX_COL.ID).setValue(INDEX_HEADER[INDEX_COL.ID - 1]);
+  }
+  migrateRowIds_(sheet);
   return sheet;
+}
+
+/**
+ * ID未付与のデータ行にUUIDを埋めるマイグレーション。
+ * 非空セルは型（数値等）を問わず一切変更しないため、何度実行しても結果が変わらない（冪等）。
+ * 手動編集等でID重複が生じていてもここでは修復しない（行特定側で先頭一致行を採用する）。
+ */
+function migrateRowIds_(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return;
+  }
+  var idValues = sheet.getRange(2, INDEX_COL.ID, lastRow - 1, 1).getValues();
+  for (var i = 0; i < idValues.length; i++) {
+    if (!String(idValues[i][0] == null ? '' : idValues[i][0]).trim()) {
+      sheet.getRange(i + 2, INDEX_COL.ID).setValue(Utilities.getUuid());
+    }
+  }
 }
 
 /**
@@ -926,6 +957,7 @@ function getOrCreateIndexSheet_() {
  * タイトル列は元記事URLへのHYPERLINK。Driveファイル列は、以前の運用（Googleドキュメント
  * への転記）で作成した記事にのみリンクが入っていたため、新規保存では常に空のままにする。
  * タグ列は複数タグを ", " 区切りで1セルにまとめる（集計・フィルタしやすい形式）。
+ * ID列には行を一意特定するUUIDを必ず付与する（編集・削除のキー）。
  */
 function appendIndexRow_(savedAt, category, title, url, memo, tags) {
   var sheet = getOrCreateIndexSheet_();
@@ -939,7 +971,8 @@ function appendIndexRow_(savedAt, category, title, url, memo, tags) {
     url,
     sanitizeCellText_(memo || ''),
     '',
-    sanitizeCellText_(tags.join(', '))
+    sanitizeCellText_(tags.join(', ')),
+    Utilities.getUuid()
   ]);
   var lastRow = sheet.getLastRow();
 
@@ -971,8 +1004,10 @@ function extractFileIdFromFormula_(formula) {
 
 /**
  * 保存済み記事の内容（タイトル・URL・メモ）を編集する(action=update)。
- * fileId（GoogleドキュメントのID）を一意キーに、Sheetsインデックスの該当行と
- * 対応するGoogleドキュメント本文の両方を更新する。
+ * 行の特定キーは id（ID列のUUID）優先・fileId（GoogleドキュメントのID）フォールバック:
+ *   - id指定時: ID列の一致行のSheetsのみ更新する（DocumentApp操作はスキップ。
+ *     新規保存の記事はDocを持たないため）。ID重複時は先頭（最古）の一致行を採用する
+ *   - fileIdのみ指定時: 従来動作（Sheets行と対応するGoogleドキュメント本文の両方を更新）
  *
  * 行特定は「Sheetsインデックスに載っている記事のみ」に限定する（任意のfileIdで
  * 自分のDrive上の無関係なファイルを触られないよう、一覧に存在する行だけを対象にする）。
@@ -981,12 +1016,13 @@ function extractFileIdFromFormula_(formula) {
  */
 function handleUpdate_(body) {
   // ステップ1: 入力検証（save と同じ方針: http/https のみ、タイトル必須）
+  var id = String(body.id || '').trim();
   var fileId = String(body.fileId || '').trim();
   var title = String(body.title || '').trim();
   var url = String(body.url || '').trim();
   var memo = String(body.memo || '').trim();
 
-  if (!fileId) {
+  if (!id && !fileId) {
     throw new Error('編集対象が指定されていません');
   }
   if (!title) {
@@ -996,18 +1032,29 @@ function handleUpdate_(body) {
     throw new Error('URLの形式が不正です: ' + url);
   }
 
-  // ステップ2: Sheetsインデックスから fileId 一致行を特定する
+  // ステップ2: Sheetsインデックスから対象行を特定する（id優先・fileIdフォールバック）
   var sheet = getOrCreateIndexSheet_();
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) {
     throw new Error('編集対象の記事が見つかりません');
   }
-  var fileFormulas = sheet.getRange(2, INDEX_COL.FILE, lastRow - 1, 1).getFormulas();
   var targetRow = -1;
-  for (var i = 0; i < fileFormulas.length; i++) {
-    if (extractFileIdFromFormula_(fileFormulas[i][0]) === fileId) {
-      targetRow = i + 2; // ヘッダ1行 + 0始まりindex の分をずらして実際の行番号にする
-      break;
+  if (id) {
+    // ID列は手動編集で数値等が入っている可能性もあるため、文字列化して比較する
+    var idValues = sheet.getRange(2, INDEX_COL.ID, lastRow - 1, 1).getValues();
+    for (var i = 0; i < idValues.length; i++) {
+      if (String(idValues[i][0] == null ? '' : idValues[i][0]).trim() === id) {
+        targetRow = i + 2; // ヘッダ1行 + 0始まりindex の分をずらして実際の行番号にする
+        break;
+      }
+    }
+  } else {
+    var fileFormulas = sheet.getRange(2, INDEX_COL.FILE, lastRow - 1, 1).getFormulas();
+    for (var j = 0; j < fileFormulas.length; j++) {
+      if (extractFileIdFromFormula_(fileFormulas[j][0]) === fileId) {
+        targetRow = j + 2;
+        break;
+      }
     }
   }
   if (targetRow === -1) {
@@ -1025,14 +1072,17 @@ function handleUpdate_(body) {
     '=HYPERLINK("' + escapeFormulaString_(url) + '","' + escapeFormulaString_(title) + '")'
   );
 
-  // ステップ4: Googleドキュメント本文を更新する（自動抽出本文・共有時URLは保持）
-  var doc = DocumentApp.openById(fileId);
-  var currentText = doc.getBody().getText();
-  var newContent = rebuildDocContent_(currentText, savedAt, category, title, url, memo);
-  doc.getBody().setText(newContent);
-  doc.saveAndClose();
+  // ステップ4: fileIdのみ指定時は従来どおりGoogleドキュメント本文も更新する
+  // （id指定時はスキップ。既存Docs記事のDoc同期はクライアントがfileIdを送ることで維持される）
+  if (!id) {
+    var doc = DocumentApp.openById(fileId);
+    var currentText = doc.getBody().getText();
+    var newContent = rebuildDocContent_(currentText, savedAt, category, title, url, memo);
+    doc.getBody().setText(newContent);
+    doc.saveAndClose();
+  }
 
-  return { ok: true, fileId: fileId, title: title, url: url, memo: memo };
+  return { ok: true, id: id, fileId: fileId, title: title, url: url, memo: memo };
 }
 
 /**

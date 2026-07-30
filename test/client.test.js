@@ -29,12 +29,14 @@ function loadSharedLogic() {
   vm.runInContext(match[1], context);
   assert.strictEqual(typeof context.parseSharedParams, 'function');
   assert.strictEqual(typeof context.moveArrayItem, 'function');
+  assert.strictEqual(typeof context.buildUpdatePayload, 'function');
   return context;
 }
 
 const sharedLogic = loadSharedLogic();
 const parseSharedParams = sharedLogic.parseSharedParams;
 const moveArrayItem = sharedLogic.moveArrayItem;
+const buildUpdatePayload = sharedLogic.buildUpdatePayload;
 
 test('shared_url にURLが入っている場合（標準形）', () => {
   const result = parseSharedParams('?shared_url=' + encodeURIComponent('https://example.com/article'));
@@ -277,24 +279,52 @@ test('編集UI: 編集ビューと入力欄に必要なDOM idが揃っている'
   assert.match(html, /VIEW_IDS = \[[\s\S]*?'editView'[\s\S]*?\]/);
 });
 
-test('編集UI: 一覧の各記事にfileIdがあれば編集ボタンを生成する', () => {
+test('編集UI: 一覧の各記事にidかfileIdがあれば編集ボタンを生成する', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/function renderListItems\(items, hasMore\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'renderListItems関数が存在すること');
-  assert.match(m[1], /if \(item\.fileId\)/, 'fileIdがある記事だけ編集可能にすること');
+  assert.match(m[1], /if \(item\.id \|\| item\.fileId\)/, 'idかfileIdがある記事だけ編集可能にすること');
   assert.match(m[1], /openEditView\(item\)/, '編集ボタンで編集ビューを開くこと');
   assert.match(m[1], /createElement\('button'\)/, '編集ボタンをDOM APIで生成すること');
 });
 
-test('編集UI: submitEditがupdateアクションをGASへ送り、成功後にキャッシュを破棄して再取得する', () => {
+test('編集UI: submitEditがbuildUpdatePayloadで組み立てたupdateアクションをGASへ送り、成功後にキャッシュを破棄して再取得する', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/async function submitEdit\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'submitEdit関数が存在すること');
-  assert.match(m[1], /action: 'update'/, 'updateアクションを送ること');
-  assert.match(m[1], /fileId: item\.fileId/, 'fileIdをキーに送ること');
+  assert.match(m[1], /buildUpdatePayload\(item, title, url, memo\)/, 'ペイロードは共通の純粋関数で組み立てること');
   assert.match(m[1], /\^https\?:/, 'URL形式を検証すること');
   assert.match(m[1], /invalidateListCache/, '編集後にキャッシュを破棄すること');
   assert.match(m[1], /await openListItemsView/, '編集後に一覧を取り直すこと');
+});
+
+// ---- 記事編集の送信キー選択（buildUpdatePayload 純粋関数） -------------
+
+test('buildUpdatePayload: idのみ持つ記事（新規保存）はidをキーに送る', () => {
+  const payload = buildUpdatePayload(
+    { id: 'uuid-1', fileId: '' }, '新タイトル', 'https://example.com/new', 'メモ'
+  );
+  // vm(別レルム)のオブジェクトはprototypeが異なるため、同レルムへコピーしてから比較する
+  assert.deepStrictEqual(Object.assign({}, payload), {
+    action: 'update', title: '新タイトル', url: 'https://example.com/new', memo: 'メモ', id: 'uuid-1'
+  });
+  assert.strictEqual('fileId' in payload, false, 'fileIdは送らないこと');
+});
+
+test('buildUpdatePayload: fileIdを持つ既存Docs記事はfileIdをキーに送る（Doc本文の同期を維持する従来動作）', () => {
+  const payload = buildUpdatePayload(
+    { id: 'uuid-2', fileId: 'doc-1' }, 't', 'https://example.com/', ''
+  );
+  assert.deepStrictEqual(Object.assign({}, payload), {
+    action: 'update', title: 't', url: 'https://example.com/', memo: '', fileId: 'doc-1'
+  });
+  assert.strictEqual('id' in payload, false, 'idを併記するとGAS側がDoc更新をスキップするため送らないこと');
+});
+
+test('buildUpdatePayload: id・fileIdのどちらも無い（旧キャッシュ由来）記事はnullを返す', () => {
+  assert.strictEqual(buildUpdatePayload({ id: '', fileId: '' }, 't', 'https://a/', ''), null);
+  assert.strictEqual(buildUpdatePayload({}, 't', 'https://a/', ''), null);
+  assert.strictEqual(buildUpdatePayload(null, 't', 'https://a/', ''), null);
 });
 
 test('編集UI: 編集は fire-and-forget にせず応答を待つ（gasPostをawaitする）', () => {
