@@ -570,3 +570,137 @@ test('タグ複数選択UI: openListItemsView・openSearchViewはタグ選択状
   assert.ok(searchOpen, 'openSearchView関数が存在すること');
   assert.match(searchOpen[1], /state\.searchFilterTags = \[\]/, '検索ビューを開くたびにタグ選択をリセットすること');
 });
+
+// ---- 一覧内タグバッジ（タグ0/1/複数件の描画差） ------------------------
+
+// createElement/appendChild/classList/textContent を持つ最小限のDOMノードスタブ。
+// 実際に renderListItems / renderSearchItems 本体を vm で実行し、
+// 生成されたDOM構造（タグバッジの有無・個数・テキスト）を検証するために使う。
+function createDomStub() {
+  function makeNode(tagName) {
+    return {
+      tagName: tagName,
+      className: '',
+      textContent: '',
+      href: '',
+      target: '',
+      rel: '',
+      children: [],
+      classList: {
+        _set: new Set(),
+        add: function (c) { this._set.add(c); },
+        contains: function (c) { return this._set.has(c); }
+      },
+      appendChild: function (child) { this.children.push(child); return child; },
+      querySelectorAll: function (selector) {
+        var wantClass = selector.replace(/^\./, '');
+        var found = [];
+        (function walk(node) {
+          node.children.forEach(function (child) {
+            if (child.className && child.className.split(' ').indexOf(wantClass) !== -1) {
+              found.push(child);
+            }
+            walk(child);
+          });
+        })(this);
+        return found;
+      },
+      addEventListener: function () {}
+    };
+  }
+  var containers = {};
+  var document = {
+    createElement: function (tagName) { return makeNode(tagName); },
+    getElementById: function (id) {
+      if (!containers[id]) {
+        var node = makeNode('div');
+        node.innerHTML = '';
+        Object.defineProperty(node, 'innerHTML', {
+          get: function () { return this._html || ''; },
+          set: function (v) { this._html = v; this.children = []; }
+        });
+        containers[id] = node;
+      }
+      return containers[id];
+    }
+  };
+  return document;
+}
+
+function runRenderFunction(fnName, items, hasMore) {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const re = new RegExp('function ' + fnName + '\\(items, hasMore\\) \\{([\\s\\S]*?)\\n    \\}');
+  const m = html.match(re);
+  assert.ok(m, fnName + '関数が存在すること');
+
+  const document = createDomStub();
+  const containerId = fnName === 'renderListItems' ? 'listItemsContainer' : 'searchItemsContainer';
+  const context = {
+    document: document,
+    state: {},
+    loadMoreListItems: function () {},
+    loadMoreSearchItems: function () {},
+    openEditView: function () {}
+  };
+  vm.createContext(context);
+  vm.runInContext('function ' + fnName + '(items, hasMore) {' + m[1] + '}', context);
+  context[fnName](items, hasMore);
+  return document.getElementById(containerId);
+}
+
+['renderListItems', 'renderSearchItems'].forEach(function (fnName) {
+  test(fnName + ': タグ0件の記事にはタグ領域自体を出さない', () => {
+    const container = runRenderFunction(fnName, [
+      { savedAt: '2026-07-31', title: 'タグなし記事', url: 'https://example.com/a', memo: '', tags: [] }
+    ], false);
+    const row = container.children[0];
+    const link = row.children[0];
+    const tagAreas = link.querySelectorAll('.list-item-tags');
+    assert.strictEqual(tagAreas.length, 0, 'タグ0件ならlist-item-tagsコンテナ自体が無いこと');
+  });
+
+  test(fnName + ': タグ1件の記事は1個のバッジを表示する', () => {
+    const container = runRenderFunction(fnName, [
+      { savedAt: '2026-07-31', title: 'タグ1件記事', url: 'https://example.com/b', memo: '', tags: ['Claude'] }
+    ], false);
+    const link = container.children[0].children[0];
+    const tagAreas = link.querySelectorAll('.list-item-tags');
+    assert.strictEqual(tagAreas.length, 1, 'タグ領域が1つ生成されること');
+    const badges = tagAreas[0].querySelectorAll('.list-item-tag-badge');
+    assert.strictEqual(badges.length, 1);
+    assert.strictEqual(badges[0].textContent, 'Claude');
+  });
+
+  test(fnName + ': タグ複数件の記事は件数分のバッジを表示する', () => {
+    const container = runRenderFunction(fnName, [
+      {
+        savedAt: '2026-07-31', title: 'タグ複数件記事', url: 'https://example.com/c', memo: '',
+        tags: ['Claude', 'GitHub', '単一タグ']
+      }
+    ], false);
+    const link = container.children[0].children[0];
+    const tagAreas = link.querySelectorAll('.list-item-tags');
+    assert.strictEqual(tagAreas.length, 1);
+    const badges = tagAreas[0].querySelectorAll('.list-item-tag-badge');
+    assert.strictEqual(badges.length, 3, 'タグの件数分バッジが生成されること');
+    assert.deepStrictEqual(badges.map(function (b) { return b.textContent; }), ['Claude', 'GitHub', '単一タグ']);
+  });
+
+  test(fnName + ': item.tagsが無い（旧キャッシュ由来のデータ）でもタグ領域を出さずエラーにならない', () => {
+    const container = runRenderFunction(fnName, [
+      { savedAt: '2026-07-31', title: 'tagsフィールドが無い旧データ', url: 'https://example.com/f', memo: '' }
+    ], false);
+    const link = container.children[0].children[0];
+    const tagAreas = link.querySelectorAll('.list-item-tags');
+    assert.strictEqual(tagAreas.length, 0, 'item.tagsが無くてもタグ領域を出さないこと');
+  });
+
+  test(fnName + ': タグバッジはtextContentで設定され、DOM APIで組み立てられる（XSS対策の踏襲）', () => {
+    const htmlSrc = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+    const re = new RegExp('function ' + fnName + '\\(items, hasMore\\) \\{([\\s\\S]*?)\\n    \\}');
+    const m = htmlSrc.match(re);
+    assert.ok(m, fnName + '関数が存在すること');
+    assert.match(m[1], /list-item-tag-badge/, 'タグバッジのクラス名が使われていること');
+    assert.match(m[1], /badge\.textContent = tag/, 'タグ名はtextContentで設定していること');
+  });
+});
