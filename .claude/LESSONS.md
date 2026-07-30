@@ -1,5 +1,11 @@
 # LESSONS.md — このプロジェクトで得た教訓
 
+## 2026-07-31 vm別レルムのオブジェクトをdeepStrictEqualで直接比較して2件失敗
+
+- 症状: index.htmlから切り出した関数(buildUpdatePayload)をvmで実行し、返り値オブジェクトを `assert.deepStrictEqual` で比較したところ「Values have same structure but are not reference-equal」で失敗した。
+- 根本原因: vm(別レルム)で生成されたオブジェクトはprototypeが本体レルムと異なり、deepStrictEqualはprototypeも比較対象にする(証拠: `Object.assign({}, payload)` で同レルムへコピーしてから比較したら成功)。配列については既存テストが同じ理由で `Array.from` 正規化を行っており、コメントにも明記されていた。
+- 教訓: vm実行結果のアサーションを書くときは、まず既存テストの同型パターン(Array.from等の正規化)を確認してから書く。配列は `Array.from`、オブジェクトは `Object.assign({}, x)` で同レルム化してから deepStrictEqual する。
+
 ## 2026-07-12 GASの新スコープはデプロイ時ではなく初実行時に承認される
 
 - 症状: OAuthスコープ(documents/spreadsheets)を追加してWebアプリを再デプロイ・承認したのに、実機からの保存で「DocumentApp.createを呼び出す権限がありません」エラーが発生した。
