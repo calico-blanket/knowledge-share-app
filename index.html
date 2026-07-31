@@ -542,7 +542,7 @@
 
     // カテゴリ一覧・タグ一覧・Driveフォルダ URL は起動時に GAS から動的取得する（ハードコードしない）
     // listCategory / listItems は記事一覧画面の「さらに読み込む」用の表示中状態
-    // editingItem は編集ビューで編集中の記事（fileId等）を保持する
+    // editingItem は編集ビューで編集中の記事（id・fileId等）を保持する
     // selectedCategory / selectedTags は保存画面で選択中の内容（確定ボタンを押すまで保存しない）
     var state = {
       categories: [], tags: [], rootFolderUrl: '',
@@ -624,6 +624,32 @@
       next[index] = next[target];
       next[target] = tmp;
       return next;
+    }
+
+    /**
+     * 記事編集(action=update)の送信ペイロードを組み立てる純粋関数。
+     * キーの選択: fileId を持つ既存Docs記事は fileId を送る（GAS側でDoc本文も
+     * 従来どおり同期更新されるため）。それ以外は id（ID列のUUID）を送る。
+     * 両方を同時に送らない（GAS側は id 優先でDoc更新をスキップするため、
+     * 既存Docs記事のDoc同期を維持するにはfileId単独で送る必要がある）。
+     *
+     * @param {Object} item - 編集対象の記事（id / fileId を保持）
+     * @param {string} title - 編集後タイトル
+     * @param {string} url - 編集後URL
+     * @param {string} memo - 編集後メモ
+     * @returns {Object|null} gasPostへ渡すボディ。キーが無い場合はnull
+     */
+    function buildUpdatePayload(item, title, url, memo) {
+      if (!item || (!item.fileId && !item.id)) {
+        return null;
+      }
+      var payload = { action: 'update', title: title, url: url, memo: memo };
+      if (item.fileId) {
+        payload.fileId = item.fileId;
+      } else {
+        payload.id = item.id;
+      }
+      return payload;
     }
     // @shared-logic-end
 
@@ -1244,9 +1270,9 @@
 
         row.appendChild(link);
 
-        // fileId のある記事（Docが特定できる記事）だけ編集可能にする。
-        // 旧データでDriveファイル列が空の行は fileId が無いため編集ボタンを出さない。
-        if (item.fileId) {
+        // id（ID列のUUID）か fileId（既存Docs記事）のどちらかで行を特定できる記事だけ
+        // 編集可能にする。旧キャッシュ由来でどちらも無いitemには編集ボタンを出さない。
+        if (item.id || item.fileId) {
           var editBtn = document.createElement('button');
           editBtn.type = 'button';
           editBtn.className = 'list-item-edit';
@@ -1463,14 +1489,16 @@
      */
     async function submitEdit() {
       var item = state.editingItem;
-      if (!item || !item.fileId) {
-        alert('編集対象が不明です。一覧からやり直してください。');
-        return;
-      }
 
       var title = document.getElementById('editTitleInput').value.trim();
       var url = document.getElementById('editUrlInput').value.trim();
       var memo = document.getElementById('editMemoInput').value.trim();
+
+      var payload = buildUpdatePayload(item, title, url, memo);
+      if (!payload) {
+        alert('編集対象が不明です。一覧からやり直してください。');
+        return;
+      }
 
       if (!title) { alert('タイトルを入力してください。'); return; }
       if (!/^https?:\/\/\S+$/i.test(url)) {
@@ -1482,9 +1510,7 @@
       button.disabled = true;
       button.textContent = '更新中…';
       try {
-        var result = await gasPost({
-          action: 'update', fileId: item.fileId, title: title, url: url, memo: memo
-        });
+        var result = await gasPost(payload);
         if (!result.ok) { throw new Error(result.error || '更新に失敗しました'); }
 
         // 編集したカテゴリの一覧キャッシュは古くなるので破棄し、最新を取り直して戻る
