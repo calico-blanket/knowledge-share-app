@@ -517,6 +517,8 @@
         <input id="editUrlInput" type="url" placeholder="https:// で始まるURL">
         <label for="editMemoInput">メモ（任意）</label>
         <input id="editMemoInput" type="text" placeholder="メモ">
+        <label>タグ</label>
+        <div id="editTagGrid" class="tag-grid"></div>
         <p class="note">保存日時・カテゴリ・自動抽出された本文はそのまま保持されます。</p>
         <button id="editSaveButton" class="primary-button" type="button">更新する</button>
       </div>
@@ -547,6 +549,7 @@
     var state = {
       categories: [], tags: [], rootFolderUrl: '',
       listCategory: '', listItems: [], listKeyword: '', listFilterTags: [], editingItem: null,
+      editSelectedTags: [],
       selectedCategory: '', selectedTags: [],
       searchKeyword: '', searchItems: [], searchFilterTags: []
     };
@@ -632,18 +635,21 @@
      * 従来どおり同期更新されるため）。それ以外は id（ID列のUUID）を送る。
      * 両方を同時に送らない（GAS側は id 優先でDoc更新をスキップするため、
      * 既存Docs記事のDoc同期を維持するにはfileId単独で送る必要がある）。
+     * tags は配列を渡すと常にペイロードへ含める（GAS側は配列指定時のみタグ列を
+     * 置き換えるため、未選択＝空配列でも明示的に送って全クリアを可能にする）。
      *
      * @param {Object} item - 編集対象の記事（id / fileId を保持）
      * @param {string} title - 編集後タイトル
      * @param {string} url - 編集後URL
      * @param {string} memo - 編集後メモ
+     * @param {Array<string>} tags - 編集後タグ
      * @returns {Object|null} gasPostへ渡すボディ。キーが無い場合はnull
      */
-    function buildUpdatePayload(item, title, url, memo) {
+    function buildUpdatePayload(item, title, url, memo, tags) {
       if (!item || (!item.fileId && !item.id)) {
         return null;
       }
-      var payload = { action: 'update', title: title, url: url, memo: memo };
+      var payload = { action: 'update', title: title, url: url, memo: memo, tags: tags };
       if (item.fileId) {
         payload.fileId = item.fileId;
       } else {
@@ -1470,7 +1476,41 @@
       document.getElementById('editTitleInput').value = item.title || '';
       document.getElementById('editUrlInput').value = item.url || '';
       document.getElementById('editMemoInput').value = item.memo || '';
+      state.editSelectedTags = (item.tags || []).slice();
+      renderEditTagButtons();
       showView('editView');
+    }
+
+    /** 編集ビューのタグ選択チップ（保存画面のtag-buttonと同じ見た目）を描画する */
+    function renderEditTagButtons() {
+      var grid = document.getElementById('editTagGrid');
+      grid.innerHTML = '';
+      if (!state.tags.length) {
+        grid.innerHTML = '<p class="empty-state">タグはまだありません。設定画面から追加できます</p>';
+        return;
+      }
+      state.tags.forEach(function (tag) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tag-button';
+        var selected = state.editSelectedTags.indexOf(tag) !== -1;
+        if (selected) { button.classList.add('tag-button-selected'); }
+        button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        button.textContent = tag;
+        button.addEventListener('click', function () { toggleEditTag(tag); });
+        grid.appendChild(button);
+      });
+    }
+
+    /** 編集ビューのタグ選択/選択解除を切り替える（複数選択可） */
+    function toggleEditTag(tag) {
+      var index = state.editSelectedTags.indexOf(tag);
+      if (index === -1) {
+        state.editSelectedTags.push(tag);
+      } else {
+        state.editSelectedTags.splice(index, 1);
+      }
+      renderEditTagButtons();
     }
 
     /** 指定カテゴリの記事一覧キャッシュを破棄する（編集で内容が変わったとき用） */
@@ -1493,8 +1533,9 @@
       var title = document.getElementById('editTitleInput').value.trim();
       var url = document.getElementById('editUrlInput').value.trim();
       var memo = document.getElementById('editMemoInput').value.trim();
+      var tags = state.editSelectedTags;
 
-      var payload = buildUpdatePayload(item, title, url, memo);
+      var payload = buildUpdatePayload(item, title, url, memo, tags);
       if (!payload) {
         alert('編集対象が不明です。一覧からやり直してください。');
         return;

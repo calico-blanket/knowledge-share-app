@@ -1169,6 +1169,75 @@ test('編集API: 数値で入っているIDも文字列比較で一致し更新�
   assert.strictEqual(sheet._rows[1][2], '数値ID編集');
 });
 
+// ---- 編集API: タグの更新 ---------------------------------------------
+
+test('編集API: tags未指定なら既存のタグ列は変更されない', () => {
+  const { context, sheet } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  const saved = callDoPost(context, { url: 'https://example.com/a', category: 'PC系', tags: ['タグA'] });
+  const listed = callDoGetList(context, 'PC系');
+  const id = listed.items[0].id;
+
+  const result = callDoPost(context, {
+    action: 'update', id: id, title: 'タイトル変更のみ', url: 'https://example.com/a2'
+  });
+  assert.strictEqual(result.ok, true);
+
+  const after = callDoGetList(context, 'PC系');
+  assert.deepStrictEqual(Array.from(after.items[0].tags), ['タグA'], 'tags未指定時はタグ列が保持される');
+});
+
+test('編集API: tagsに空配列を指定すると全タグがクリアされる', () => {
+  const { context, sheet } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系', tags: ['タグA'] });
+  const listed = callDoGetList(context, 'PC系');
+  const id = listed.items[0].id;
+
+  const result = callDoPost(context, {
+    action: 'update', id: id, title: 'クリア後', url: 'https://example.com/a2', tags: []
+  });
+  assert.strictEqual(result.ok, true);
+
+  const after = callDoGetList(context, 'PC系');
+  assert.deepStrictEqual(Array.from(after.items[0].tags), [], 'tags:[]指定時は全タグがクリアされる');
+});
+
+test('編集API: 未登録タグを指定すると「不明なタグです」エラーになり、行は変更されない', () => {
+  const { context, sheet } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系', tags: ['タグA'] });
+  const listed = callDoGetList(context, 'PC系');
+  const id = listed.items[0].id;
+  const before = sheet._rows.map((r) => r.slice());
+
+  const result = callDoPost(context, {
+    action: 'update', id: id, title: 'タイトル変更', url: 'https://example.com/a2', tags: ['未登録タグ']
+  });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /不明なタグです: 未登録タグ/);
+  assert.deepStrictEqual(sheet._rows, before, 'エラー時はどの列も変更されない');
+});
+
+test('編集API: 有効なtags配列を指定すると、既存のタイトル・タグを新しい組み合わせで置き換える', () => {
+  const { context, sheet } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  callDoPost(context, { action: 'addTag', name: 'タグB' });
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系', tags: ['タグA'] });
+  const listed = callDoGetList(context, 'PC系');
+  const id = listed.items[0].id;
+
+  const result = callDoPost(context, {
+    action: 'update', id: id, title: 'タグ入れ替え後', url: 'https://example.com/a2', tags: ['タグB']
+  });
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(Array.from(result.tags), ['タグB'], '応答のtagsにも反映される');
+
+  const after = callDoGetList(context, 'PC系');
+  assert.deepStrictEqual(Array.from(after.items[0].tags), ['タグB']);
+  assert.strictEqual(sheet._rows[1][6], 'タグB', 'タグ列は", "区切りフォーマットで書き込まれる（1件なので区切り文字なし）');
+});
+
 // ---- URL解決（短縮/リダイレクトリンク対策） -----------------------
 
 test('resolveFinalUrl_: リダイレクトが無ければ元のURLをそのまま返す', () => {
