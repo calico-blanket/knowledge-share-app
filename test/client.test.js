@@ -292,39 +292,91 @@ test('編集UI: submitEditがbuildUpdatePayloadで組み立てたupdateアクシ
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/async function submitEdit\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'submitEdit関数が存在すること');
-  assert.match(m[1], /buildUpdatePayload\(item, title, url, memo\)/, 'ペイロードは共通の純粋関数で組み立てること');
+  assert.match(m[1], /buildUpdatePayload\(item, title, url, memo, tags\)/, 'ペイロードは共通の純粋関数で組み立てること');
   assert.match(m[1], /\^https\?:/, 'URL形式を検証すること');
   assert.match(m[1], /invalidateListCache/, '編集後にキャッシュを破棄すること');
   assert.match(m[1], /await openListItemsView/, '編集後に一覧を取り直すこと');
+});
+
+// ---- 編集UI: タグ選択チップ --------------------------------------------
+
+test('編集UI: 編集モーダルにタグ選択チップ用のコンテナがあり、メモ欄の直後・注記の前に配置される', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(html, /id="editTagGrid"/, 'タグ選択チップ用のコンテナがあること');
+  const view = html.match(/<div id="editView"[\s\S]*?<\/div>\s*<\/div>/);
+  assert.ok(view, 'editViewが存在すること');
+  const memoIdx = view[0].indexOf('id="editMemoInput"');
+  const tagIdx = view[0].indexOf('id="editTagGrid"');
+  const noteIdx = view[0].indexOf('class="note"');
+  assert.ok(memoIdx < tagIdx && tagIdx < noteIdx, 'メモ欄の直後・保存日時等の注記の前にタグ選択が配置されること');
+});
+
+test('編集UI: openEditViewは対象記事のtagsをstate.editSelectedTagsへコピーしてタグチップを描画する', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function openEditView\(item\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'openEditView関数が存在すること');
+  assert.match(m[1], /state\.editSelectedTags = \(item\.tags \|\| \[\]\)\.slice\(\)/, '記事のtagsを複製して初期選択状態にすること（元配列を破壊しない）');
+  assert.match(m[1], /renderEditTagButtons\(\)/, 'タグチップを描画すること');
+});
+
+test('編集UI: renderEditTagButtonsは選択中タグをtag-button-selectedでハイライトし、タップでtoggleEditTagを呼ぶ', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function renderEditTagButtons\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'renderEditTagButtons関数が存在すること');
+  assert.match(m[1], /state\.editSelectedTags\.indexOf\(tag\)/, '選択中タグをstate.editSelectedTagsで判定すること');
+  assert.match(m[1], /tag-button-selected/, '選択中タグをハイライトすること');
+  assert.match(m[1], /toggleEditTag\(tag\)/, 'タップでtoggleEditTagを呼ぶこと');
+});
+
+test('編集UI: toggleEditTagはタグの選択/選択解除を切り替えて再描画する（複数選択可）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/function toggleEditTag\(tag\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'toggleEditTag関数が存在すること');
+  assert.match(m[1], /state\.editSelectedTags\.push\(tag\)/, '未選択なら追加すること');
+  assert.match(m[1], /state\.editSelectedTags\.splice\(index, 1\)/, '選択済みなら除去すること');
+  assert.match(m[1], /renderEditTagButtons\(\)/, '切り替え後に再描画すること');
+});
+
+test('編集UI: submitEditはstate.editSelectedTagsをtagsとしてbuildUpdatePayloadへ渡す', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const m = html.match(/async function submitEdit\(\) \{([\s\S]*?)\n    \}/);
+  assert.ok(m, 'submitEdit関数が存在すること');
+  assert.match(m[1], /var tags = state\.editSelectedTags/, '選択中タグをペイロード組み立てに使うこと');
 });
 
 // ---- 記事編集の送信キー選択（buildUpdatePayload 純粋関数） -------------
 
 test('buildUpdatePayload: idのみ持つ記事（新規保存）はidをキーに送る', () => {
   const payload = buildUpdatePayload(
-    { id: 'uuid-1', fileId: '' }, '新タイトル', 'https://example.com/new', 'メモ'
+    { id: 'uuid-1', fileId: '' }, '新タイトル', 'https://example.com/new', 'メモ', ['タグA']
   );
   // vm(別レルム)のオブジェクトはprototypeが異なるため、同レルムへコピーしてから比較する
   assert.deepStrictEqual(Object.assign({}, payload), {
-    action: 'update', title: '新タイトル', url: 'https://example.com/new', memo: 'メモ', id: 'uuid-1'
+    action: 'update', title: '新タイトル', url: 'https://example.com/new', memo: 'メモ',
+    tags: ['タグA'], id: 'uuid-1'
   });
   assert.strictEqual('fileId' in payload, false, 'fileIdは送らないこと');
 });
 
 test('buildUpdatePayload: fileIdを持つ既存Docs記事はfileIdをキーに送る（Doc本文の同期を維持する従来動作）', () => {
   const payload = buildUpdatePayload(
-    { id: 'uuid-2', fileId: 'doc-1' }, 't', 'https://example.com/', ''
+    { id: 'uuid-2', fileId: 'doc-1' }, 't', 'https://example.com/', '', []
   );
   assert.deepStrictEqual(Object.assign({}, payload), {
-    action: 'update', title: 't', url: 'https://example.com/', memo: '', fileId: 'doc-1'
+    action: 'update', title: 't', url: 'https://example.com/', memo: '', tags: [], fileId: 'doc-1'
   });
   assert.strictEqual('id' in payload, false, 'idを併記するとGAS側がDoc更新をスキップするため送らないこと');
 });
 
 test('buildUpdatePayload: id・fileIdのどちらも無い（旧キャッシュ由来）記事はnullを返す', () => {
-  assert.strictEqual(buildUpdatePayload({ id: '', fileId: '' }, 't', 'https://a/', ''), null);
-  assert.strictEqual(buildUpdatePayload({}, 't', 'https://a/', ''), null);
-  assert.strictEqual(buildUpdatePayload(null, 't', 'https://a/', ''), null);
+  assert.strictEqual(buildUpdatePayload({ id: '', fileId: '' }, 't', 'https://a/', '', []), null);
+  assert.strictEqual(buildUpdatePayload({}, 't', 'https://a/', '', []), null);
+  assert.strictEqual(buildUpdatePayload(null, 't', 'https://a/', '', []), null);
+});
+
+test('buildUpdatePayload: tagsに空配列を渡すと全クリアの意図でtags:[]がそのまま送られる（未指定=保持とは区別する）', () => {
+  const payload = buildUpdatePayload({ id: 'uuid-3', fileId: '' }, 't', 'https://a/', '', []);
+  assert.deepStrictEqual(Array.from(payload.tags), []);
 });
 
 test('編集UI: 編集は fire-and-forget にせず応答を待つ（gasPostをawaitする）', () => {
