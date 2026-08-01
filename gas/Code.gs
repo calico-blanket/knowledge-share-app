@@ -292,6 +292,8 @@ function splitTagsText_(tagsText) {
  *   - update           : { id | fileId, title, url, memo?, tags? } 保存済み記事の内容を編集
  *                        （id優先。fileIdのみ指定時は既存Googleドキュメントの本文も更新する。
  *                          tagsは配列指定時のみ置き換え、未指定なら現状維持）
+ *   - delete           : { id } 保存済み記事をSheetsの行ごと物理削除する
+ *                        （Drive上の過去Docsは削除しない。非破壊方針は removeCategory と同じ）
  *   - addTag           : { name } をタグ一覧に追加
  *   - removeTag        : { name } をタグ一覧から削除（保存済みデータは残す）
  *   - reorderTags      : { tags } の順にタグの並び順を変更
@@ -314,6 +316,8 @@ function doPost(e) {
         return jsonResponse_(handleReorderCategories_(body));
       case 'update':
         return jsonResponse_(handleUpdate_(body));
+      case 'delete':
+        return jsonResponse_(handleDelete_(body));
       case 'addTag':
         return jsonResponse_(handleAddTag_(body));
       case 'removeTag':
@@ -1001,6 +1005,55 @@ function extractFileIdFromFormula_(formula) {
   return m ? m[1] : '';
 }
 
+/**
+ * インデックスシートのID列をデータ行（シートの2行目以降）から走査し、
+ * 指定idと一致する最初の行番号（1始まり、ヘッダ込み）を返す純粋寄りの関数。
+ * ID列は手動編集で数値等が入っている可能性もあるため、文字列化して比較する。
+ * 見つからない場合は -1 を返す。ID重複時は先頭（最古）の一致行を採用する
+ * （handleUpdate_・handleDelete_で共通の行特定ロジック）。
+ */
+function findRowIndexById_(sheet, lastRow, id) {
+  var idValues = sheet.getRange(2, INDEX_COL.ID, lastRow - 1, 1).getValues();
+  for (var i = 0; i < idValues.length; i++) {
+    if (String(idValues[i][0] == null ? '' : idValues[i][0]).trim() === id) {
+      return i + 2; // ヘッダ1行 + 0始まりindex の分をずらして実際の行番号にする
+    }
+  }
+  return -1;
+}
+
+// ---- 保存済み記事の削除（action=delete） ----------------------
+
+/**
+ * 保存済み記事をSheetsの行ごと物理削除する(action=delete)。
+ * id（ID列のUUID）でのみ行を特定する（handleUpdate_と同じfindRowIndexById_を使い、
+ * 並行編集で行番号がずれても呼び出しのたびに特定し直すため安全）。
+ * Drive上の過去Docs（fileId列が残っている行）は削除しない（非破壊。
+ * removeCategory_・removeTag_と同じ設計思想。Docsはもう正本ではないため）。
+ * この削除は取り消せない（deleteRowによる物理削除のため、復元する場合は
+ * スプレッドシートのバージョン履歴から手動で戻す必要がある）。
+ */
+function handleDelete_(body) {
+  var id = String(body.id || '').trim();
+  if (!id) {
+    throw new Error('削除対象が指定されていません');
+  }
+
+  var sheet = getOrCreateIndexSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    throw new Error('削除対象の記事が見つかりません');
+  }
+
+  var targetRow = findRowIndexById_(sheet, lastRow, id);
+  if (targetRow === -1) {
+    throw new Error('削除対象の記事が見つかりません');
+  }
+
+  sheet.deleteRow(targetRow);
+  return { ok: true, id: id };
+}
+
 // ---- 保存済み記事の編集（action=update） ----------------------
 
 /**
@@ -1054,14 +1107,7 @@ function handleUpdate_(body) {
   }
   var targetRow = -1;
   if (id) {
-    // ID列は手動編集で数値等が入っている可能性もあるため、文字列化して比較する
-    var idValues = sheet.getRange(2, INDEX_COL.ID, lastRow - 1, 1).getValues();
-    for (var i = 0; i < idValues.length; i++) {
-      if (String(idValues[i][0] == null ? '' : idValues[i][0]).trim() === id) {
-        targetRow = i + 2; // ヘッダ1行 + 0始まりindex の分をずらして実際の行番号にする
-        break;
-      }
-    }
+    targetRow = findRowIndexById_(sheet, lastRow, id);
   } else {
     var fileFormulas = sheet.getRange(2, INDEX_COL.FILE, lastRow - 1, 1).getFormulas();
     for (var j = 0; j < fileFormulas.length; j++) {
