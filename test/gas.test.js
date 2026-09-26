@@ -300,9 +300,9 @@ function callDoGetList(context, category, token, offset, keyword, tags) {
   return JSON.parse(output.getContent());
 }
 
-/** doGet を ?action=search&keyword=...&token=...&offset=...&tags=... 相当のパラメータで呼び、レスポンスJSONを返す */
-function callDoGetSearch(context, keyword, token, offset, tags) {
-  const e = { parameter: { action: 'search', keyword: keyword, token: token, offset: offset, tags: tags } };
+/** doGet を ?action=search&keyword=...&token=...&offset=...&tags=...&category=... 相当のパラメータで呼び、レスポンスJSONを返す */
+function callDoGetSearch(context, keyword, token, offset, tags, category) {
+  const e = { parameter: { action: 'search', keyword: keyword, token: token, offset: offset, tags: tags, category: category } };
   const output = context.doGet(e);
   return JSON.parse(output.getContent());
 }
@@ -721,7 +721,37 @@ test('タグ絞り込み: カテゴリ横断検索(action=search)でもAND条件
   assert.strictEqual(result.items[0].url, 'https://example.com/both');
 });
 
-test('escapeFormulaString_: ダブルクォートが二重化される（数式インジェクション対策）', () => {
+test('カテゴリ横断検索: categoryを指定するとそのカテゴリだけに絞り込める（keyword・tagsと併用可）', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { action: 'addTag', name: 'タグA' });
+  callDoPost(context, { url: 'https://example.com/pc1', category: 'PC系', memo: '共通ワード', tags: ['タグA'] });
+  callDoPost(context, { url: 'https://example.com/pc2', category: 'PC系', memo: '共通ワード' });
+  callDoPost(context, { url: 'https://example.com/dtp', category: 'DTP系', memo: '共通ワード', tags: ['タグA'] });
+
+  const byCategory = callDoGetSearch(context, '共通ワード', undefined, undefined, undefined, 'PC系');
+  assert.strictEqual(byCategory.ok, true);
+  assert.deepStrictEqual(Array.from(byCategory.items, (it) => it.url),
+    ['https://example.com/pc2', 'https://example.com/pc1']);
+
+  const withTags = callDoGetSearch(context, '', undefined, undefined, 'タグA', 'PC系');
+  assert.deepStrictEqual(Array.from(withTags.items, (it) => it.url), ['https://example.com/pc1']);
+
+  // keyword・tags無しでもカテゴリだけで絞り込める（検索画面でカテゴリのみ選んだ場合）
+  const categoryOnly = callDoGetSearch(context, '', undefined, undefined, undefined, 'DTP系');
+  assert.deepStrictEqual(Array.from(categoryOnly.items, (it) => it.url), ['https://example.com/dtp']);
+});
+
+test('カテゴリ横断検索: categoryが未指定・空白のみなら全カテゴリが対象、存在しないカテゴリは0件', () => {
+  const { context } = loadGasScript();
+  callDoPost(context, { url: 'https://example.com/a', category: 'PC系' });
+  callDoPost(context, { url: 'https://example.com/b', category: 'DTP系' });
+
+  assert.strictEqual(callDoGetSearch(context, '', undefined, undefined, undefined, undefined).items.length, 2);
+  assert.strictEqual(callDoGetSearch(context, '', undefined, undefined, undefined, '  ').items.length, 2);
+  assert.strictEqual(callDoGetSearch(context, '', undefined, undefined, undefined, '存在しない').items.length, 0);
+});
+
+test('escapeFormulaString_:ダブルクォートが二重化される（数式インジェクション対策）', () => {
   const { context } = loadGasScript();
   assert.strictEqual(
     context.escapeFormulaString_('タイトルに"引用符"あり'),
@@ -2047,6 +2077,76 @@ test('編集API防御: メモの数式インジェクションはサニタイズ
   );
 });
 
+// ---- タグ自動提案 (action=suggestTags, Jev API 連携) -----------------
+
+test('タグ提案: 正常系 - Jev が確率を返し、閾値以上のタグのみ suggested に含まれる', () => {
+  const tags = ['Claude', 'GitHub', 'Blender', 'DTP'];
+  const { context } = loadGasScript({
+    scriptProperties: { TAGS_JSON: JSON.stringify(tags), TYPESAFE_API_KEY: 'test-key' },
+    fetchImpl: (url, params) => {
+      // Jev API のモックレスポンス
+      const body = JSON.stringify({
+        answers: {
+          tag_Claude:   { noul: 0.92 },
+          tag_GitHub:   { noul: 0.35 },
+          tag_Blender:  { noul: 0.72 },
+          tag_DTP:      { noul: 0.45 }
+        }
+      });
+      return makeFetchResponse({ code: 200, body: body });
+    }
+  });
+  const result = callDoPost(context, {
+    action: 'suggestTags',
+    url: 'https://example.com/article',
+    title: 'Claude AIの使い方',
+    memo: '3Dについて'
+  });
+  assert.strictEqual(result.ok, true);
+  // 閾値0.6以上のタグのみ返る（Claude: 0.92, Blender: 0.72）
+  assert.deepStrictEqual(Array.from(result.suggested).sort(), ['Blender', 'Claude']);
+});
+
+test('タグ提案: タグが0件の場合はJevを呼ばずempty配列を返す', () => {
+  let fetchCalled = false;
+  const { context } = loadGasScript({
+    scriptProperties: { TAGS_JSON: JSON.stringify([]), TYPESAFE_API_KEY: 'test-key' },
+    fetchImpl: () => { fetchCalled = true; return makeFetchResponse({ code: 200, body: '{}' }); }
+  });
+  const result = callDoPost(context, { action: 'suggestTags', url: 'https://example.com/', title: 'テスト', memo: '' });
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.suggested, []);
+  assert.strictEqual(fetchCalled, false, 'タグ0件ならJev APIを呼ばないこと');
+});
+
+test('タグ提案: TYPESAFE_API_KEYが未設定の場合はエラーを返す', () => {
+  const { context } = loadGasScript({
+    scriptProperties: { TAGS_JSON: JSON.stringify(['Claude']) }
+  });
+  const result = callDoPost(context, { action: 'suggestTags', url: 'https://example.com/', title: 'テスト', memo: '' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /TYPESAFE_API_KEY/, 'TYPESAFE_API_KEY未設定のエラーを返すこと');
+});
+
+test('タグ提案: SHARED_TOKEN設定時、合言葉が違うと拒否される', () => {
+  const { context } = loadGasScript({
+    scriptProperties: { SHARED_TOKEN: 'himitsu', TYPESAFE_API_KEY: 'test-key' }
+  });
+  const result = callDoPost(context, { action: 'suggestTags', url: 'https://example.com/', title: 'x', memo: '', token: 'chigau' });
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /合言葉が一致しません/);
+});
+
+test('タグ提案: Jev APIが失敗した場合はエラーを返す', () => {
+  const { context } = loadGasScript({
+    scriptProperties: { TAGS_JSON: JSON.stringify(['Claude']), TYPESAFE_API_KEY: 'test-key' },
+    fetchImpl: () => { throw new Error('ネットワークエラー'); }
+  });
+  const result = callDoPost(context, { action: 'suggestTags', url: 'https://example.com/', title: 'テスト', memo: '' });
+  assert.strictEqual(result.ok, false);
+  assert.ok(result.error, 'エラーメッセージが含まれること');
+});
+
 // ---- 新規追加関数の重複定義チェック（教訓の再発防止パターン） ----------
 
 test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（重複定義の再発防止）', () => {
@@ -2059,7 +2159,7 @@ test('Code.gs: 主要関数の定義がそれぞれちょうど1つである（�
     'handleAddTag_', 'handleRemoveTag_', 'handleReorderTags_', 'fetchPageTitle_',
     'handleSearch_', 'collectListItems_', 'normalizeOffset_', 'normalizeKeyword_',
     'isXPost_', 'normalizeTagsParam_', 'rowMatchesAllTags_', 'migrateRowIds_',
-    'handleDelete_', 'findRowIndexById_'
+    'handleDelete_', 'findRowIndexById_', 'handleSuggestTags_'
   ];
   for (const fn of names) {
     const definitions = source.match(new RegExp('function ' + fn + '\\(', 'g')) || [];

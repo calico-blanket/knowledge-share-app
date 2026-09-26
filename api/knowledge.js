@@ -12,7 +12,7 @@
 
 'use strict';
 
-const ALLOWED_PARAMS = ['action', 'keyword', 'category', 'offset'];
+const ALLOWED_PARAMS = ['action', 'keyword', 'category', 'offset', 'tags'];
 
 module.exports = async function handler(req, res) {
   const gasUrl = process.env.GAS_URL;

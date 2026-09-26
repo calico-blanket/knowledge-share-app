@@ -319,13 +319,15 @@ test('編集UI: openEditViewは対象記事のtagsをstate.editSelectedTagsへ�
   assert.match(m[1], /renderEditTagButtons\(\)/, 'タグチップを描画すること');
 });
 
-test('編集UI: renderEditTagButtonsは選択中タグをtag-button-selectedでハイライトし、タップでtoggleEditTagを呼ぶ', () => {
+test('編集UI: renderEditTagButtonsは折りたたみ式タグピッカーを使ってtoggleEditTagを呼ぶ', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/function renderEditTagButtons\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(m, 'renderEditTagButtons関数が存在すること');
-  assert.match(m[1], /state\.editSelectedTags\.indexOf\(tag\)/, '選択中タグをstate.editSelectedTagsで判定すること');
-  assert.match(m[1], /tag-button-selected/, '選択中タグをハイライトすること');
-  assert.match(m[1], /toggleEditTag\(tag\)/, 'タップでtoggleEditTagを呼ぶこと');
+  // 折りたたみ式タグピッカー(renderTagPicker)を使う形に変わったため、
+  // state.editSelectedTags と toggleEditTag への委譲を確認する
+  assert.match(m[1], /renderTagPicker\(/, '折りたたみピッカーを使うこと');
+  assert.match(m[1], /state\.editSelectedTags/, '選択中タグをstate.editSelectedTagsから渡すこと');
+  assert.match(m[1], /toggleEditTag/, 'タップでtoggleEditTagを呼ぶこと');
 });
 
 test('編集UI: toggleEditTagはタグの選択/選択解除を切り替えて再描画する（複数選択可）', () => {
@@ -334,7 +336,7 @@ test('編集UI: toggleEditTagはタグの選択/選択解除を切り替えて�
   assert.ok(m, 'toggleEditTag関数が存在すること');
   assert.match(m[1], /state\.editSelectedTags\.push\(tag\)/, '未選択なら追加すること');
   assert.match(m[1], /state\.editSelectedTags\.splice\(index, 1\)/, '選択済みなら除去すること');
-  assert.match(m[1], /renderEditTagButtons\(\)/, '切り替え後に再描画すること');
+  assert.match(m[1], /updateTagPicker\(/, '切り替え後にupdateTagPickerで再描画すること');
 });
 
 test('編集UI: submitEditはstate.editSelectedTagsをtagsとしてbuildUpdatePayloadへ渡す', () => {
@@ -494,7 +496,9 @@ test('タグUI: タグボタンの複数選択チップが描画され、確定�
   assert.match(html, /id="tagGrid"/, 'タグ表示用のコンテナがあること');
   const render = html.match(/function renderMainTagButtons\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(render, 'renderMainTagButtons関数が存在すること');
-  assert.match(render[1], /toggleMainTag\(tag\)/, 'タップでtoggleMainTagを呼ぶこと');
+  // 折りたたみ式ピッカーへ委譲する形に変わったため renderTagPicker への委譲を確認する
+  assert.match(render[1], /renderTagPicker\(/, '折りたたみピッカーへ委譲すること');
+  assert.match(render[1], /toggleMainTag/, 'タップでtoggleMainTagを呼ぶこと');
 
   const toggle = html.match(/function toggleMainTag\(tag\) \{([\s\S]*?)\n    \}/);
   assert.ok(toggle, 'toggleMainTag関数が存在すること（複数選択のトグル）');
@@ -638,12 +642,12 @@ test('タグ複数選択UI: 一覧・横断検索の両画面にタグフィル�
   assert.match(html, /id="searchTagFilterGrid"/, '横断検索画面にタグフィルター用のコンテナがあること');
 });
 
-test('タグ複数選択UI: renderTagFilterButtonsは選択中タグをハイライトし、タップでonToggleを呼ぶ', () => {
+test('タグ複数選択UI: renderTagFilterButtonsは折りたたみ式タグピッカー(renderTagPicker)へ委譲する', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/function renderTagFilterButtons\(containerId, selectedTags, onToggle\) \{([\s\S]*?)\n    \}/);
-  assert.ok(m, 'renderTagFilterButtons関数が存在すること');
-  assert.match(m[1], /tag-filter-button-selected/, '選択中タグをハイライトすること');
-  assert.match(m[1], /onToggle\(tag\)/, 'タップでonToggleを呼ぶこと');
+  assert.ok(m, 'renderTagFilterButtons関数が存在すること（後方互換ラッパー）');
+  assert.match(m[1], /renderTagPicker\(/, '折りたたみピッカーへ委譲すること');
+  assert.match(m[1], /onToggle/, 'onToggle コールバックを引き渡すこと');
 });
 
 test('タグ複数選択UI: toggleListFilterTagはstate.listFilterTagsを更新して検索を再実行する', () => {
@@ -782,44 +786,48 @@ function runRenderFunction(fnName, items, hasMore) {
       { savedAt: '2026-07-31', title: 'タグなし記事', url: 'https://example.com/a', memo: '', tags: [] }
     ], false);
     const row = container.children[0];
-    const link = row.children[0];
-    const tagAreas = link.querySelectorAll('.list-item-tags');
+    // タグは折りたたみ表示のため row を起点に検索する
+    const tagAreas = row.querySelectorAll('.list-item-tags');
     assert.strictEqual(tagAreas.length, 0, 'タグ0件ならlist-item-tagsコンテナ自体が無いこと');
   });
 
-  test(fnName + ': タグ1件の記事は1個のバッジを表示する', () => {
+  test(fnName + ': タグ1件の記事は折りたたみボタンとバッジを生成する', () => {
     const container = runRenderFunction(fnName, [
       { savedAt: '2026-07-31', title: 'タグ1件記事', url: 'https://example.com/b', memo: '', tags: ['Claude'] }
     ], false);
-    const link = container.children[0].children[0];
-    const tagAreas = link.querySelectorAll('.list-item-tags');
+    const row = container.children[0];
+    // タグはリンクの外(row)に折りたたみで置く
+    const tagAreas = row.querySelectorAll('.list-item-tags');
     assert.strictEqual(tagAreas.length, 1, 'タグ領域が1つ生成されること');
     const badges = tagAreas[0].querySelectorAll('.list-item-tag-badge');
     assert.strictEqual(badges.length, 1);
     assert.strictEqual(badges[0].textContent, 'Claude');
   });
 
-  test(fnName + ': タグ複数件の記事は件数分のバッジを表示する', () => {
+  test(fnName + ': タグ複数件の記事は件数分のバッジを折りたたみ式で表示する', () => {
     const container = runRenderFunction(fnName, [
       {
         savedAt: '2026-07-31', title: 'タグ複数件記事', url: 'https://example.com/c', memo: '',
         tags: ['Claude', 'GitHub', '単一タグ']
       }
     ], false);
-    const link = container.children[0].children[0];
-    const tagAreas = link.querySelectorAll('.list-item-tags');
+    const row = container.children[0];
+    const tagAreas = row.querySelectorAll('.list-item-tags');
     assert.strictEqual(tagAreas.length, 1);
     const badges = tagAreas[0].querySelectorAll('.list-item-tag-badge');
     assert.strictEqual(badges.length, 3, 'タグの件数分バッジが生成されること');
     assert.deepStrictEqual(badges.map(function (b) { return b.textContent; }), ['Claude', 'GitHub', '単一タグ']);
+    // 折りたたみボタンが存在すること（querySelectorAll で className を確認）
+    const toggleBtns = row.querySelectorAll('.tag-toggle-btn');
+    assert.strictEqual(toggleBtns.length, 1, '折りたたみ開閉ボタンが1つ存在すること');
   });
 
   test(fnName + ': item.tagsが無い（旧キャッシュ由来のデータ）でもタグ領域を出さずエラーにならない', () => {
     const container = runRenderFunction(fnName, [
       { savedAt: '2026-07-31', title: 'tagsフィールドが無い旧データ', url: 'https://example.com/f', memo: '' }
     ], false);
-    const link = container.children[0].children[0];
-    const tagAreas = link.querySelectorAll('.list-item-tags');
+    const row = container.children[0];
+    const tagAreas = row.querySelectorAll('.list-item-tags');
     assert.strictEqual(tagAreas.length, 0, 'item.tagsが無くてもタグ領域を出さないこと');
   });
 

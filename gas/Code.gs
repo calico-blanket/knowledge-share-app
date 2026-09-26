@@ -87,7 +87,7 @@ function doGet(e) {
     return handleList_(e.parameter.category, token, e.parameter.offset, e.parameter.keyword, e.parameter.tags);
   }
   if (action === 'search') {
-    return handleSearch_(token, e.parameter.offset, e.parameter.keyword, e.parameter.tags);
+    return handleSearch_(token, e.parameter.offset, e.parameter.keyword, e.parameter.tags, e.parameter.category);
   }
   if (action === 'categories') {
     return handleCategories_(token);
@@ -146,20 +146,23 @@ function handleList_(category, token, offsetParam, keywordParam, tagsParam) {
 }
 
 /**
- * カテゴリを横断して、タイトル・メモ・タグのいずれかにキーワードが部分一致（大文字小文字を
- * 区別しない）する記事一覧を新しい順に返す（action=search、URLは絞り込み対象外）。
- * tags（カンマ区切り）を指定すると、そのすべてのタグを持つ記事だけに絞り込む（AND条件、keywordと併用可）。
+ * カテゴリを横断（または指定カテゴリ内）で、タイトル・メモ・タグのいずれかにキーワードが
+ * 部分一致（大文字小文字を区別しない）する記事一覧を新しい順に返す（action=search）。
+ * category を指定するとそのカテゴリだけに絞り込む（未指定・空白なら全カテゴリ対象）。
+ * tags（カンマ区切り）を指定すると、そのすべてのタグを持つ記事だけに絞り込む（AND条件）。
+ * keyword・category・tags は任意で、すべて指定なし／空のときは全カテゴリ全件を対象にする。
  * カテゴリ内一覧（handleList_）と同じくLIST_PAGE_SIZE件区切り・offset/hasMoreページング。
  * 結果には複数カテゴリの記事が混在しうるため、各記事に category を含める。
  */
-function handleSearch_(token, offsetParam, keywordParam, tagsParam) {
+function handleSearch_(token, offsetParam, keywordParam, tagsParam, categoryParam) {
   try {
     checkToken_(token);
 
     var offset = normalizeOffset_(offsetParam);
     var keyword = normalizeKeyword_(keywordParam);
     var tags = normalizeTagsParam_(tagsParam);
-    var page = collectListItems_('', keyword, tags, offset);
+    var categoryFilter = String(categoryParam || '').trim();
+    var page = collectListItems_(categoryFilter, keyword, tags, offset);
 
     return jsonResponse_({
       ok: true, items: page.items, offset: offset, hasMore: page.hasMore
@@ -324,6 +327,8 @@ function doPost(e) {
         return jsonResponse_(handleRemoveTag_(body));
       case 'reorderTags':
         return jsonResponse_(handleReorderTags_(body));
+      case 'suggestTags':
+        return jsonResponse_(handleSuggestTags_(body));
       default:
         throw new Error('不明なactionです: ' + action);
     }
@@ -1182,6 +1187,75 @@ function extractDocBodyText_(text) {
     return '';
   }
   return source.substring(idx + marker.length).replace(/^\s+/, '').replace(/\s+$/, '');
+}
+
+// ============================================================
+// タグ自動提案（Jev / TypeSafe API 連携）
+// ============================================================
+
+/**
+ * 登録済みタグ一覧を対象に、URL・タイトル・メモから Jev に各タグの適合確率を
+ * 問い合わせ、閾値(0.6)以上のタグ名を配列で返す（action=suggestTags）。
+ * タグが0件の場合は Jev を呼ばず空配列を返す。
+ * API キーは GAS スクリプトプロパティ TYPESAFE_API_KEY に設定する。
+ */
+function handleSuggestTags_(body) {
+  checkToken_(body.token);
+
+  var apiKey = PropertiesService.getScriptProperties().getProperty('TYPESAFE_API_KEY') || '';
+  if (!apiKey) {
+    throw new Error('TYPESAFE_API_KEY がスクリプトプロパティに設定されていません');
+  }
+
+  var tags = getTags_();
+  if (!tags.length) {
+    return { ok: true, suggested: [] };
+  }
+
+  // Jev に渡す記事情報（タイトル・URL・メモの3フィールド）
+  var state = {
+    title: String(body.title || ''),
+    url:   String(body.url   || ''),
+    memo:  String(body.memo  || '')
+  };
+
+  // タグごとに1つの Noul 質問（tag名をキーにする。コロン等は使えないのでプレフィックスで区別）
+  var questions = {};
+  tags.forEach(function (tag) {
+    questions['tag_' + tag] = {
+      type: 'noul',
+      instructions: '記事のタイトル・URL・メモに基づき、このタグ「' + tag + '」は記事に適合しますか？'
+    };
+  });
+
+  var requestBody = JSON.stringify({
+    model: 'jev-latest',
+    state: state,
+    questions: questions
+  });
+
+  var response = UrlFetchApp.fetch('https://api.typesafe.ai/v1/systemone', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + apiKey },
+    payload: requestBody,
+    muteHttpExceptions: true
+  });
+
+  var code = response.getResponseCode();
+  var responseText = response.getContentText();
+  if (code !== 200) {
+    throw new Error('Jev API エラー(HTTP ' + code + '): ' + responseText.slice(0, 200));
+  }
+
+  var data = JSON.parse(responseText);
+  var THRESHOLD = 0.6;
+  var suggested = tags.filter(function (tag) {
+    var answer = data.answers && data.answers['tag_' + tag];
+    return answer && typeof answer.noul === 'number' && answer.noul >= THRESHOLD;
+  });
+
+  return { ok: true, suggested: suggested };
 }
 
 /**
