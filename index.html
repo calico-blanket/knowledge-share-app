@@ -1040,7 +1040,17 @@
      * @param {function} onToggle - tag を引数に取るトグルコールバック
      * @param {string} [emptyMessage] - タグ0件のときのメッセージ（任意）
      */
-    function renderTagPicker(containerId, selectedTags, onToggle, emptyMessage) {
+    /**
+     * renderTagPicker の内部実装。
+     * selectedTags を配列ではなく「配列を返す関数」として受け取ることで、
+     * toggle のたびに state が新しい配列に置き換わる場合でも常に最新の選択状態を参照できる。
+     */
+    function renderTagPicker(containerId, getSelectedOrArray, onToggle, emptyMessage) {
+      // 後方互換: 配列を渡された場合はそれを返す関数に変換する
+      var getSelected = typeof getSelectedOrArray === 'function'
+        ? getSelectedOrArray
+        : function () { return getSelectedOrArray; };
+
       var container = document.getElementById(containerId);
       container.innerHTML = '';
 
@@ -1088,7 +1098,9 @@
       container.appendChild(picker);
 
       // 選択中バッジとチップ一覧を描画する内部関数
+      // repaint のたびに getSelected() を呼ぶことで、常に最新の配列を参照する
       function repaint(filter) {
+        var selectedTags = getSelected(); // 毎回最新の配列を取得
         var f = (filter || '').toLowerCase();
 
         // ヘッダのバッジ更新
@@ -1151,10 +1163,11 @@
     }
 
     /**
-     * タグピッカーの selectedTags を更新して再描画する。
-     * renderTagPicker の後に呼ぶ。
+     * タグピッカーを再描画する（選択状態の更新後に呼ぶ）。
+     * renderTagPicker を getSelected 関数で初期化した場合は自動的に最新の状態を取得するため、
+     * このメソッドは再描画のトリガーとしてのみ機能する。
      */
-    function updateTagPicker(containerId, selectedTags) {
+    function updateTagPicker(containerId) {
       var picker = document.querySelector('#' + containerId + ' .tag-picker');
       if (picker && picker._repaint) { picker._repaint(); }
     }
@@ -1204,7 +1217,7 @@
 
     /** 保存画面のタグボタン（複数選択チップ）を描画する */
     function renderMainTagButtons() {
-      renderTagPicker('tagGrid', state.selectedTags, toggleMainTag,
+      renderTagPicker('tagGrid', function () { return state.selectedTags; }, toggleMainTag,
         'タグはまだありません。設定画面から追加できます');
     }
 
@@ -1217,7 +1230,7 @@
         state.selectedTags.splice(index, 1);
       }
       // ピッカーを作り直さず、選択状態だけ再描画する
-      updateTagPicker('tagGrid', state.selectedTags);
+      updateTagPicker('tagGrid');
     }
 
     /** 確定ボタンの有効/無効を、カテゴリが選択されているかで切り替える */
@@ -1383,7 +1396,7 @@
       state.listKeyword = '';
       state.listFilterTags = [];
       searchInput.value = '';
-      renderTagFilterButtons('listTagFilterGrid', state.listFilterTags, toggleListFilterTag);
+      renderTagPicker('listTagFilterGrid', function () { return state.listFilterTags; }, toggleListFilterTag);
 
       var cacheMap = loadCache(LIST_CACHE_KEY) || {};
       var cached = cacheMap[category];
@@ -1458,7 +1471,7 @@
       state.listFilterTags = index === -1
         ? state.listFilterTags.concat([tag])
         : state.listFilterTags.filter(function (t) { return t !== tag; });
-      renderTagFilterButtons('listTagFilterGrid', state.listFilterTags, toggleListFilterTag);
+      updateTagPicker('listTagFilterGrid');
       runListSearch();
     }
 
@@ -1634,7 +1647,7 @@
         sel.appendChild(opt);
       });
       sel.value = '';
-      renderTagPicker('searchTagFilterGrid', state.searchFilterTags, toggleSearchFilterTag);
+      renderTagPicker('searchTagFilterGrid', function () { return state.searchFilterTags; }, toggleSearchFilterTag);
       document.getElementById('searchItemsContainer').innerHTML =
         '<p class="empty-state">カテゴリ・タグを選ぶかキーワードを入力してください</p>';
       showView('searchView');
@@ -1655,7 +1668,7 @@
       state.searchFilterTags = index === -1
         ? state.searchFilterTags.concat([tag])
         : state.searchFilterTags.filter(function (t) { return t !== tag; });
-      updateTagPicker('searchTagFilterGrid', state.searchFilterTags);
+      updateTagPicker('searchTagFilterGrid');
       runGlobalSearch();
     }
 
@@ -1828,7 +1841,7 @@
 
     /** 編集ビューのタグ選択チップを折りたたみ式ピッカーで描画する */
     function renderEditTagButtons() {
-      renderTagPicker('editTagGrid', state.editSelectedTags, toggleEditTag,
+      renderTagPicker('editTagGrid', function () { return state.editSelectedTags; }, toggleEditTag,
         'タグはまだありません。設定画面から追加できます');
     }
 
@@ -1840,7 +1853,7 @@
       } else {
         state.editSelectedTags.splice(index, 1);
       }
-      updateTagPicker('editTagGrid', state.editSelectedTags);
+      updateTagPicker('editTagGrid');
     }
 
     /** 指定カテゴリの記事一覧キャッシュを破棄する（編集で内容が変わったとき用） */
@@ -2308,7 +2321,7 @@
               state.selectedTags.push(tag);
             }
           });
-          updateTagPicker('tagGrid', state.selectedTags);
+          updateTagPicker('tagGrid');
           status.textContent = '✨ 提案: ' + suggested.join(', ');
         }
       } catch (err) {
