@@ -1249,7 +1249,7 @@ function handleSuggestTags_(body) {
   }
 
   var data = JSON.parse(responseText);
-  var THRESHOLD = 0.6;
+  var THRESHOLD = 0.5;
   var suggested = tags.filter(function (tag) {
     var answer = data.answers && data.answers['tag_' + tag];
     return answer && typeof answer.noul === 'number' && answer.noul >= THRESHOLD;
